@@ -27,8 +27,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.avium.autotask.ui.theme.AutoTaskTheme
 import org.avium.autotask.util.HiddenApiAccess
 import org.avium.autotask.util.InputInjector
@@ -38,6 +41,7 @@ class FullScreenOverlayService : LifecycleService() {
     private val questionState = mutableStateOf<String?>(null)
     private val composeViewTreeOwner = OverlayComposeViewTreeOwner()
     private var isStopping = false
+    private val tapPassThroughMutex = Mutex()
 
     private val systemEventReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -178,17 +182,26 @@ class FullScreenOverlayService : LifecycleService() {
 
     private fun handlePreviewTap(x: Float, y: Float, isDoubleTap: Boolean) {
         serviceScope.launch {
-            setOverlayTouchable(isTouchable = false)
-            try {
-                withContext(Dispatchers.Default) {
-                    if (isDoubleTap) {
-                        InputInjector.doubleTap(x, y)
-                    } else {
-                        InputInjector.tap(x, y)
+            tapPassThroughMutex.withLock {
+                setOverlayTouchable(isTouchable = false)
+                try {
+                    // Give WM one frame to apply NOT_TOUCHABLE before injecting.
+                    delay(16)
+                    val injected = withContext(Dispatchers.Default) {
+                        if (isDoubleTap) {
+                            InputInjector.doubleTap(x, y)
+                        } else {
+                            InputInjector.tap(x, y)
+                        }
                     }
+                    if (!injected) {
+                        Log.w(TAG, "Tap passthrough injection failed at ($x,$y), doubleTap=$isDoubleTap")
+                    }
+                } finally {
+                    // Delay a bit to prevent the tail of injected events being intercepted by overlay.
+                    delay(16)
+                    setOverlayTouchable(isTouchable = true)
                 }
-            } finally {
-                setOverlayTouchable(isTouchable = true)
             }
         }
     }
