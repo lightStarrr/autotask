@@ -7,9 +7,11 @@ import android.graphics.Canvas
 import android.graphics.ColorSpace
 import android.graphics.Paint
 import android.graphics.Rect
+import android.hardware.display.DisplayManager
 import android.hardware.HardwareBuffer
 import android.util.DisplayMetrics
 import android.util.Log
+import android.view.Display
 import androidx.core.graphics.createBitmap
 import androidx.core.graphics.scale
 import java.io.ByteArrayOutputStream
@@ -49,23 +51,24 @@ object FrameBufferCapture {
     @SuppressLint("BlockedPrivateApi", "PrivateApi")
     private fun captureFrameBuffer(context: Context): Bitmap? {
         HiddenApiAccess.ensureExemptions()
+        val visualContext = context.ensureVisualContext()
 
-        captureViaAsyncScreenCapture(context)?.let {
+        captureViaAsyncScreenCapture(visualContext)?.let {
             lastErrorMessage = ""
             return it
         }
 
-        captureViaDisplayArgsClass(ownerClassName = "android.window.ScreenCapture", context = context)?.let {
+        captureViaDisplayArgsClass(ownerClassName = "android.window.ScreenCapture", context = visualContext)?.let {
             lastErrorMessage = ""
             return it
         }
 
-        captureViaDisplayArgsClass(ownerClassName = "android.view.SurfaceControl", context = context)?.let {
+        captureViaDisplayArgsClass(ownerClassName = "android.view.SurfaceControl", context = visualContext)?.let {
             lastErrorMessage = ""
             return it
         }
 
-        captureViaLegacySurfaceControlScreenshot(context)?.let {
+        captureViaLegacySurfaceControlScreenshot(visualContext)?.let {
             lastErrorMessage = ""
             return it
         }
@@ -81,7 +84,7 @@ object FrameBufferCapture {
             val screenCaptureClass = Class.forName("android.window.ScreenCapture")
             val paramsClass = Class.forName("android.window.ScreenCapture\$ScreenCaptureParams")
             val outcomeReceiverClass = Class.forName("android.os.OutcomeReceiver")
-            val displayId = context.display?.displayId ?: 0
+            val displayId = resolveDisplayId(context)
             val metrics = displayMetrics(context)
 
             val params = buildScreenCaptureParams(screenCaptureClass, paramsClass, displayId, metrics)
@@ -334,7 +337,7 @@ object FrameBufferCapture {
     @SuppressLint("PrivateApi")
     private fun resolveDisplayToken(context: Context): Any {
         val surfaceControlClass = Class.forName("android.view.SurfaceControl")
-        val displayId = context.display?.displayId ?: 0
+        val displayId = resolveDisplayId(context)
 
         invokeStaticNoArg(surfaceControlClass, "getInternalDisplayToken")?.let { return it }
         invokeStaticOneArg(surfaceControlClass, "getBuiltInDisplay", 0)?.let { return it }
@@ -514,6 +517,24 @@ object FrameBufferCapture {
 
     private fun displayMetrics(context: Context): DisplayMetrics {
         return context.resources.displayMetrics
+    }
+
+    private fun Context.ensureVisualContext(): Context {
+        val displayManager = getSystemService(DisplayManager::class.java) ?: return this
+        val display = displayManager.getDisplay(Display.DEFAULT_DISPLAY)
+            ?: displayManager.displays.firstOrNull()
+            ?: return this
+
+        return runCatching {
+            createDisplayContext(display)
+        }.getOrDefault(this)
+    }
+
+    private fun resolveDisplayId(context: Context): Int {
+        val displayManager = context.getSystemService(DisplayManager::class.java)
+        val display = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
+            ?: displayManager?.displays?.firstOrNull()
+        return display?.displayId ?: 0
     }
 
     private fun preprocess(bitmap: Bitmap): Bitmap {

@@ -60,7 +60,7 @@ fun DebugTriggerScreen() {
                 activity?.finish()
             }
         ) {
-            Text("触发全屏效果")
+            Text("打开全屏悬浮窗")
         }
     }
 }
