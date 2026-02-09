@@ -10,10 +10,8 @@ import android.content.Intent
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.hardware.input.InputManager
-import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
-import android.net.Uri
 import android.content.pm.ServiceInfo
 import android.util.Log
 import android.view.MotionEvent
@@ -23,6 +21,7 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.animation.ValueAnimator
+import android.annotation.SuppressLint
 import android.view.animation.DecelerateInterpolator
 
 import org.avium.autotask.IntentKeys.EXTRA_PACKAGE_NAME
@@ -30,6 +29,7 @@ import org.avium.autotask.IntentKeys.EXTRA_QUESTION
 import org.avium.autotask.IntentKeys.EXTRA_ACTIVITY_NAME
 import org.avium.autotask.IntentKeys.EXTRA_TOUCH_PASSTHROUGH
 import org.avium.autotask.util.InputInjector
+import androidx.core.net.toUri
 
 class FullScreenOverlayService : Service() {
     private val tag = "FullScreenOverlayService"
@@ -73,15 +73,11 @@ class FullScreenOverlayService : Service() {
         displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
         inputManager = getSystemService(Context.INPUT_SERVICE) as InputManager
         val notification = createNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
-        }
+        startForeground(
+            NOTIFICATION_ID,
+            notification,
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+        )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -124,6 +120,7 @@ class FullScreenOverlayService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    @SuppressLint("ClickableViewAccessibility")
     private fun ensureOverlay() {
         if (overlayRoot != null) {
             launchTargetOnDisplay()
@@ -154,7 +151,7 @@ class FullScreenOverlayService : Service() {
             val scale = if (isMinimized) MINIMIZED_SIZE.toFloat() / largeWindowWidth.toFloat() else 1f
             scaleX = scale
             scaleY = scale
-            setOnTouchListener { view, event ->
+            setOnTouchListener { _, event ->
                 handleTouch(event)
                 true // 消费事件
             }
@@ -351,7 +348,7 @@ class FullScreenOverlayService : Service() {
 
     private fun resolveDialerFallback(): Intent? {
         val dialIntent = Intent(Intent.ACTION_DIAL).apply {
-            data = Uri.parse("tel:")
+            data = "tel:".toUri()
             setPackage(targetPackage)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
@@ -363,7 +360,7 @@ class FullScreenOverlayService : Service() {
 
     private fun resolveDialerImplicit(): Intent? {
         val dialIntent = Intent(Intent.ACTION_DIAL).apply {
-            data = Uri.parse("tel:")
+            data = "tel:".toUri()
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         val resolved = dialIntent.resolveActivity(packageManager) ?: return null
@@ -502,9 +499,6 @@ class FullScreenOverlayService : Service() {
     }
 
     private fun handleLargeWindowDrag(event: MotionEvent) {
-        val params = overlayParams ?: return
-        val root = overlayRoot ?: return
-
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
                 dragStartY = event.rawY
@@ -732,15 +726,13 @@ class FullScreenOverlayService : Service() {
 
     private fun createNotification(): Notification {
         val channelId = NOTIFICATION_CHANNEL_ID
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            val channel = NotificationChannel(
-                channelId,
-                "AutoTask Overlay",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            manager.createNotificationChannel(channel)
-        }
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val channel = NotificationChannel(
+            channelId,
+            "AutoTask Overlay",
+            NotificationManager.IMPORTANCE_LOW
+        )
+        manager.createNotificationChannel(channel)
         return Notification.Builder(this, channelId)
             .setContentTitle("AutoTask")
             .setContentText("Overlay running")
@@ -768,11 +760,7 @@ class FullScreenOverlayService : Service() {
                 putExtra(EXTRA_PACKAGE_NAME, packageName ?: DEFAULT_TARGET_PACKAGE)
                 putExtra(EXTRA_ACTIVITY_NAME, activityName)
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
-            }
+            context.startForegroundService(intent)
         }
 
         fun setTouchPassthrough(context: Context, enabled: Boolean) {
@@ -780,22 +768,7 @@ class FullScreenOverlayService : Service() {
                 action = ACTION_SET_TOUCH_PASSTHROUGH
                 putExtra(EXTRA_TOUCH_PASSTHROUGH, enabled)
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
-            }
-        }
-
-        fun toggleWindowSize(context: Context) {
-            val intent = Intent(context, FullScreenOverlayService::class.java).apply {
-                action = ACTION_TOGGLE_SIZE
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
-            }
+            context.startForegroundService(intent)
         }
 
         fun stop(context: Context) {

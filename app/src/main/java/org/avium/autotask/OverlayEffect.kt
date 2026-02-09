@@ -17,12 +17,8 @@ object OverlayEffect {
             WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED or
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE // 不获取焦点，避免影响其他应用
 
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        val type =
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        } else {
-            @Suppress("DEPRECATION")
-            WindowManager.LayoutParams.TYPE_PHONE
-        }
 
         return WindowManager.LayoutParams(
             width,
