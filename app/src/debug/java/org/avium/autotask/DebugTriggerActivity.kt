@@ -1,6 +1,5 @@
 package org.avium.autotask
 
-import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -24,17 +23,19 @@ class DebugTriggerActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent {
             AutoTaskTheme {
-                DebugTriggerScreen()
+                DebugPanel()
             }
         }
     }
 }
 
 @Composable
-fun DebugTriggerScreen() {
+private fun DebugPanel() {
     val context = LocalContext.current
-    val activity = context as? ComponentActivity
-    val input = remember { mutableStateOf("") }
+    val questionState = remember { mutableStateOf("") }
+    val packageState = remember { mutableStateOf("mark.via") }
+    val activityState = remember { mutableStateOf("") }
+    val passthroughState = remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
@@ -42,25 +43,50 @@ fun DebugTriggerScreen() {
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text(text = "测试触发器（仅 Debug）")
+        Text(text = "AutoTask Debug")
+
         OutlinedTextField(
-            value = input.value,
-            onValueChange = { input.value = it },
-            label = { Text("输入问题") },
-            singleLine = true
+            value = questionState.value,
+            onValueChange = { questionState.value = it },
+            label = { Text(text = "Question extra") }
         )
+
+        OutlinedTextField(
+            value = packageState.value,
+            onValueChange = { packageState.value = it },
+            label = { Text(text = "Target package") }
+        )
+
+        OutlinedTextField(
+            value = activityState.value,
+            onValueChange = { activityState.value = it },
+            label = { Text(text = "Target activity (optional)") }
+        )
+
         Button(
             onClick = {
-                val intent = Intent(Intent.ACTION_VIEW).apply {
-                    setClassName(context, MainActivity::class.java.name)
-                    putExtra(EXTRA_QUESTION, input.value)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                context.startActivity(intent)
-                activity?.finish()
+                FullScreenOverlayService.start(
+                    context,
+                    questionState.value.ifBlank { null },
+                    packageState.value.ifBlank { null },
+                    activityState.value.ifBlank { null }
+                )
             }
         ) {
-            Text("打开全屏悬浮窗")
+            Text(text = "Start Overlay")
+        }
+
+        Button(
+            onClick = {
+                passthroughState.value = !passthroughState.value
+                FullScreenOverlayService.setTouchPassthrough(context, passthroughState.value)
+            }
+        ) {
+            Text(text = if (passthroughState.value) "Disable Passthrough" else "Enable Passthrough")
+        }
+
+        Button(onClick = { FullScreenOverlayService.stop(context) }) {
+            Text(text = "Stop Overlay")
         }
     }
 }

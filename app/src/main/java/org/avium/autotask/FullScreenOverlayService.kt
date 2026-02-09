@@ -1,268 +1,474 @@
 package org.avium.autotask
 
-import android.content.BroadcastReceiver
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
-import android.graphics.Color
-import android.graphics.PixelFormat
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.hardware.input.InputManager
+import android.os.Build
+import android.os.IBinder
+import android.os.SystemClock
+import android.net.Uri
+import android.content.pm.ServiceInfo
 import android.util.Log
-import android.view.Gravity
-import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.Surface
+import android.view.TextureView
+import android.view.View
 import android.view.WindowManager
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.ui.platform.ComposeView
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleService
-import androidx.lifecycle.LifecycleRegistry
-import androidx.lifecycle.ViewModelStore
-import androidx.lifecycle.ViewModelStoreOwner
-import androidx.lifecycle.setViewTreeLifecycleOwner
-import androidx.lifecycle.setViewTreeViewModelStoreOwner
-import androidx.savedstate.SavedStateRegistry
-import androidx.savedstate.SavedStateRegistryController
-import androidx.savedstate.SavedStateRegistryOwner
-import androidx.savedstate.setViewTreeSavedStateRegistryOwner
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import org.avium.autotask.ui.theme.AutoTaskTheme
-import org.avium.autotask.util.HiddenApiAccess
+import android.widget.FrameLayout
+
+import org.avium.autotask.IntentKeys.EXTRA_PACKAGE_NAME
+import org.avium.autotask.IntentKeys.EXTRA_QUESTION
+import org.avium.autotask.IntentKeys.EXTRA_ACTIVITY_NAME
+import org.avium.autotask.IntentKeys.EXTRA_TOUCH_PASSTHROUGH
 import org.avium.autotask.util.InputInjector
 
-class FullScreenOverlayService : LifecycleService() {
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val questionState = mutableStateOf<String?>(null)
-    private val composeViewTreeOwner = OverlayComposeViewTreeOwner()
-    private var isStopping = false
-    private val tapPassThroughMutex = Mutex()
-
-    private val systemEventReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            when (intent?.action) {
-                Intent.ACTION_SCREEN_OFF -> stopOverlay("screen_off")
-                ACTION_CLOSE_SYSTEM_DIALOGS_COMPAT -> {
-                    val reason = intent.getStringExtra(EXTRA_SYSTEM_DIALOG_REASON)
-                    if (reason in EXIT_SYSTEM_DIALOG_REASONS) {
-                        stopOverlay("system_dialog:$reason")
-                    }
-                }
-            }
-        }
-    }
+class FullScreenOverlayService : Service() {
+    private val tag = "FullScreenOverlayService"
 
     private lateinit var windowManager: WindowManager
-    private var overlayView: ComposeView? = null
-    private var overlayLayoutParams: WindowManager.LayoutParams? = null
+    private lateinit var displayManager: DisplayManager
+    private lateinit var inputManager: InputManager
+
+    private var overlayRoot: FrameLayout? = null
+    private var textureView: TextureView? = null
+    private var overlayParams: WindowManager.LayoutParams? = null
+
+    private var virtualDisplay: VirtualDisplay? = null
+    private var touchPassthrough = false
+    private var touchDownTime = 0L
+
+    // 用于拖动的变量
+    private var lastTouchX = 0f
+    private var lastTouchY = 0f
+    private var isDragging = false
+
+    private var question: String? = null
+    private var targetPackage: String = DEFAULT_TARGET_PACKAGE
+    private var targetActivity: String? = null
 
     override fun onCreate() {
         super.onCreate()
-        HiddenApiAccess.ensureExemptions()
-        composeViewTreeOwner.performCreate()
-        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        registerSystemEventReceiver()
+        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+        inputManager = getSystemService(Context.INPUT_SERVICE) as InputManager
+        val notification = createNotification()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP_OVERLAY) {
-            stopOverlay("explicit_stop")
-            return START_NOT_STICKY
+        when (intent?.action) {
+            ACTION_START -> {
+                question = intent.getStringExtra(EXTRA_QUESTION)
+                targetPackage = intent.getStringExtra(EXTRA_PACKAGE_NAME) ?: DEFAULT_TARGET_PACKAGE
+                targetActivity = intent.getStringExtra(EXTRA_ACTIVITY_NAME)
+                touchPassthrough = false
+                ensureOverlay()
+            }
+            ACTION_SET_TOUCH_PASSTHROUGH -> {
+                val enabled = intent.getBooleanExtra(EXTRA_TOUCH_PASSTHROUGH, false)
+                setTouchPassthroughInternal(enabled)
+            }
+            ACTION_STOP -> {
+                stopSelf()
+            }
         }
-
-        questionState.value = intent?.getStringExtra(EXTRA_QUESTION)
-        ensureOverlayAttached()
         return START_STICKY
     }
 
     override fun onDestroy() {
-        unregisterSystemEventReceiver()
-        removeOverlay()
-        serviceScope.cancel()
-        composeViewTreeOwner.performDestroy()
         super.onDestroy()
+        try {
+            overlayRoot?.let { windowManager.removeViewImmediate(it) }
+        } catch (e: Exception) {
+            Log.w(tag, "Failed to remove overlay", e)
+        }
+        overlayRoot = null
+        textureView = null
+        virtualDisplay?.release()
+        virtualDisplay = null
     }
 
-    private fun ensureOverlayAttached() {
-        if (overlayView != null) {
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun ensureOverlay() {
+        if (overlayRoot != null) {
+            launchTargetOnDisplay()
             return
         }
 
-        val layoutParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-            // Disable WM automatic fitting so the overlay can draw into status/navigation bar areas.
-            setFitInsetsTypes(0)
-            setFitInsetsSides(0)
-            setFitInsetsIgnoringVisibility(true)
-        }
-
+        // 获取屏幕尺寸并计算窗口大小（屏幕的 70%）
         val displayMetrics = resources.displayMetrics
-        val view = ComposeView(this).apply {
-            setBackgroundColor(Color.TRANSPARENT)
-            isFocusable = true
-            isFocusableInTouchMode = true
-            setOnKeyListener { _, keyCode, event ->
-                if (keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
-                    stopOverlay("back_key")
-                    true
+        val windowWidth = (displayMetrics.widthPixels * 0.7).toInt()
+        val windowHeight = (displayMetrics.heightPixels * 0.7).toInt()
+
+        overlayParams = OverlayEffect.buildLayoutParams(touchPassthrough, windowWidth, windowHeight)
+        overlayRoot = FrameLayout(this).apply {
+            setBackgroundColor(0xFF000000.toInt())
+        }
+        textureView = TextureView(this).apply {
+            isOpaque = false
+            surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                override fun onSurfaceTextureAvailable(
+                    surfaceTexture: android.graphics.SurfaceTexture,
+                    width: Int,
+                    height: Int
+                ) {
+                    surfaceTexture.setDefaultBufferSize(width, height)
+                    val surface = Surface(surfaceTexture)
+                    attachVirtualDisplay(surface, width, height)
+                }
+
+                override fun onSurfaceTextureSizeChanged(
+                    surfaceTexture: android.graphics.SurfaceTexture,
+                    width: Int,
+                    height: Int
+                ) {
+                    surfaceTexture.setDefaultBufferSize(width, height)
+                }
+
+                override fun onSurfaceTextureDestroyed(surfaceTexture: android.graphics.SurfaceTexture): Boolean {
+                    return true
+                }
+
+                override fun onSurfaceTextureUpdated(surfaceTexture: android.graphics.SurfaceTexture) = Unit
+            }
+            setOnTouchListener { view, event ->
+                if (touchPassthrough) {
+                    // 拖动模式：允许拖动悬浮窗
+                    handleDragEvent(event)
+                    true // 消费事件
                 } else {
-                    false
-                }
-            }
-            setViewTreeLifecycleOwner(composeViewTreeOwner)
-            setViewTreeSavedStateRegistryOwner(composeViewTreeOwner)
-            setViewTreeViewModelStoreOwner(composeViewTreeOwner)
-            setContent {
-                AutoTaskTheme {
-                    FullScreenHaloOverlay(
-                        question = questionState.value,
-                        screenMetrics = displayMetrics,
-                        onPreviewTap = { x, y, isDoubleTap ->
-                            handlePreviewTap(x, y, isDoubleTap)
-                        }
-                    )
+                    // 非穿透模式：注入触摸事件到虚拟显示器
+                    handleTouchEvent(event)
+                    true // 消费事件
                 }
             }
         }
 
-        windowManager.addView(view, layoutParams)
-        view.requestFocus()
-        overlayView = view
-        overlayLayoutParams = layoutParams
+        overlayRoot?.addView(
+            textureView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+
+        windowManager.addView(overlayRoot, overlayParams)
     }
 
-    private fun removeOverlay() {
-        val view = overlayView ?: return
-        runCatching {
-            view.disposeComposition()
-            windowManager.removeView(view)
-        }
-        overlayView = null
-        overlayLayoutParams = null
-    }
-
-    private fun registerSystemEventReceiver() {
-        val filter = IntentFilter().apply {
-            addAction(Intent.ACTION_SCREEN_OFF)
-            addAction(ACTION_CLOSE_SYSTEM_DIALOGS_COMPAT)
-        }
-        registerReceiver(systemEventReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-    }
-
-    private fun unregisterSystemEventReceiver() {
-        runCatching {
-            unregisterReceiver(systemEventReceiver)
-        }
-    }
-
-    private fun stopOverlay(reason: String) {
-        if (isStopping) {
-            return
-        }
-        isStopping = true
-        Log.i(TAG, "Stopping overlay, reason=$reason")
-        questionState.value = null
-        removeOverlay()
-        stopSelf()
-    }
-
-    private fun handlePreviewTap(x: Float, y: Float, isDoubleTap: Boolean) {
-        serviceScope.launch {
-            tapPassThroughMutex.withLock {
-                setOverlayTouchable(isTouchable = false)
-                try {
-                    // Give WM one frame to apply NOT_TOUCHABLE before injecting.
-                    delay(16)
-                    val injected = withContext(Dispatchers.Default) {
-                        if (isDoubleTap) {
-                            InputInjector.doubleTap(x, y)
-                        } else {
-                            InputInjector.tap(x, y)
-                        }
-                    }
-                    if (!injected) {
-                        Log.w(TAG, "Tap passthrough injection failed at ($x,$y), doubleTap=$isDoubleTap")
-                    }
-                } finally {
-                    // Delay a bit to prevent the tail of injected events being intercepted by overlay.
-                    delay(16)
-                    setOverlayTouchable(isTouchable = true)
-                }
-            }
-        }
-    }
-
-    private fun setOverlayTouchable(isTouchable: Boolean) {
-        val layoutParams = overlayLayoutParams ?: return
-        val view = overlayView ?: return
-
-        val updatedFlags = if (isTouchable) {
-            layoutParams.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+    private fun attachVirtualDisplay(surface: Surface, width: Int, height: Int) {
+        val densityDpi = resources.displayMetrics.densityDpi
+        if (virtualDisplay == null) {
+            // 使用 OWN_CONTENT_ONLY 不需要镜像权限
+            val flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
+            virtualDisplay = displayManager.createVirtualDisplay(
+                "AutoTask@${SystemClock.uptimeMillis()}",
+                width,
+                height,
+                densityDpi,
+                surface,
+                flags
+            )
+            launchTargetOnDisplay()
         } else {
-            layoutParams.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            virtualDisplay?.surface = surface
+        }
+    }
+
+    private fun launchTargetOnDisplay() {
+        val display = virtualDisplay?.display ?: return
+        val options = android.app.ActivityOptions.makeBasic().setLaunchDisplayId(display.displayId)
+        val candidates = if (targetPackage == DEFAULT_TARGET_PACKAGE) {
+            listOfNotNull(resolveDialerImplicit(), resolveDialerFallback())
+        } else {
+            listOfNotNull(
+                resolveExplicitIntent(),
+                resolveLaunchIntent(),
+                resolveDialerFallback(),
+                resolveDialerImplicit()
+            )
         }
 
-        if (updatedFlags == layoutParams.flags) {
+        if (candidates.isEmpty()) {
+            Log.w(tag, "Launch intent not found for $targetPackage")
             return
         }
 
-        layoutParams.flags = updatedFlags
-        runCatching {
-            windowManager.updateViewLayout(view, layoutParams)
+        for (intent in candidates) {
+            question?.let { intent.putExtra(EXTRA_QUESTION, it) }
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            try {
+                startActivity(intent, options.toBundle())
+                return
+            } catch (e: Exception) {
+                Log.e(tag, "Failed to start target activity with $intent", e)
+            }
         }
+    }
+
+    private fun resolveLaunchIntent(): Intent? {
+        Log.d(tag, "resolveLaunchIntent: targetPackage=$targetPackage")
+
+        // 首先检查包是否存在
+        try {
+            packageManager.getPackageInfo(targetPackage, 0)
+            Log.d(tag, "Package $targetPackage exists")
+        } catch (e: Exception) {
+            Log.w(tag, "Package $targetPackage not found", e)
+            return null
+        }
+
+        val launchIntent = packageManager.getLaunchIntentForPackage(targetPackage)
+        if (launchIntent != null) {
+            Log.d(tag, "Found launch intent: ${launchIntent.component}")
+            return launchIntent
+        }
+        Log.d(tag, "getLaunchIntentForPackage returned null")
+
+        val queryIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val resolveInfos = packageManager.queryIntentActivities(queryIntent, 0)
+        Log.d(tag, "Query found ${resolveInfos.size} launcher activities")
+
+        val match = resolveInfos.firstOrNull { it.activityInfo.packageName == targetPackage }
+        if (match == null) {
+            Log.w(tag, "No launcher activity found for $targetPackage")
+
+            // 列出该包的所有 activities 用于调试
+            try {
+                val packageInfo = packageManager.getPackageInfo(
+                    targetPackage,
+                    android.content.pm.PackageManager.GET_ACTIVITIES
+                )
+                packageInfo.activities?.forEach {
+                    Log.d(tag, "  Available activity: ${it.name}")
+                }
+            } catch (e: Exception) {
+                Log.e(tag, "Failed to list activities", e)
+            }
+            return null
+        }
+
+        val activityName = match.activityInfo.name
+        return Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).apply {
+            component = ComponentName(targetPackage, activityName)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            Log.d(tag, "Resolved launcher activity: $targetPackage/$activityName")
+        }
+    }
+
+    private fun resolveExplicitIntent(): Intent? {
+        val activityName = targetActivity?.takeIf { it.isNotBlank() } ?: return null
+        val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).apply {
+            component = ComponentName(targetPackage, activityName)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val resolved = intent.resolveActivity(packageManager)
+        if (resolved == null) {
+            Log.w(tag, "Explicit activity not found: $targetPackage/$activityName")
+            return null
+        }
+        return intent
+    }
+
+    private fun resolveDialerFallback(): Intent? {
+        val dialIntent = Intent(Intent.ACTION_DIAL).apply {
+            data = Uri.parse("tel:")
+            setPackage(targetPackage)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val resolved = dialIntent.resolveActivity(packageManager) ?: return null
+        return dialIntent.setComponent(resolved).also {
+            Log.d(tag, "Resolved dial activity: ${resolved.packageName}/${resolved.className}")
+        }
+    }
+
+    private fun resolveDialerImplicit(): Intent? {
+        val dialIntent = Intent(Intent.ACTION_DIAL).apply {
+            data = Uri.parse("tel:")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val resolved = dialIntent.resolveActivity(packageManager) ?: return null
+        return dialIntent.also {
+            Log.d(tag, "Resolved implicit dial activity: ${resolved.packageName}/${resolved.className}")
+        }
+    }
+
+    private fun setTouchPassthroughInternal(enabled: Boolean) {
+        touchPassthrough = enabled
+        val root = overlayRoot ?: return
+        val params = overlayParams ?: return
+        val newParams = OverlayEffect.buildLayoutParams(touchPassthrough, params.width, params.height).apply {
+            width = params.width
+            height = params.height
+            x = params.x
+            y = params.y
+        }
+        overlayParams = newParams
+        windowManager.updateViewLayout(root, newParams)
+    }
+
+    private fun handleTouchEvent(event: MotionEvent) {
+        val display = virtualDisplay?.display ?: return
+        val displayId = display.displayId
+
+        when (event.action) {
+            MotionEvent.ACTION_DOWN -> {
+                touchDownTime = SystemClock.uptimeMillis()
+                InputInjector.injectMotionEvent(
+                    inputManager,
+                    displayId,
+                    MotionEvent.ACTION_DOWN,
+                    event.x,
+                    event.y,
+                    touchDownTime
+                )
+            }
+            MotionEvent.ACTION_MOVE -> {
+                InputInjector.injectMotionEvent(
+                    inputManager,
+                    displayId,
+                    MotionEvent.ACTION_MOVE,
+                    event.x,
+                    event.y,
+                    touchDownTime
+                )
+            }
+            MotionEvent.ACTION_UP -> {
+                InputInjector.injectMotionEvent(
+                    inputManager,
+                    displayId,
+                    MotionEvent.ACTION_UP,
+                    event.x,
+                    event.y,
+                    touchDownTime
+                )
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                InputInjector.injectMotionEvent(
+                    inputManager,
+                    displayId,
+                    MotionEvent.ACTION_CANCEL,
+                    event.x,
+                    event.y,
+                    touchDownTime
+                )
+            }
+        }
+    }
+
+    private fun handleDragEvent(event: MotionEvent) {
+        val params = overlayParams ?: return
+        val root = overlayRoot ?: return
+
+        when (event.action) {
+            MotionEvent.ACTION_DOWN -> {
+                // 记录初始触摸位置
+                lastTouchX = event.rawX
+                lastTouchY = event.rawY
+                isDragging = false
+            }
+            MotionEvent.ACTION_MOVE -> {
+                // 计算移动距离
+                val deltaX = event.rawX - lastTouchX
+                val deltaY = event.rawY - lastTouchY
+
+                // 如果移动距离超过阈值，标记为拖动
+                if (!isDragging && (Math.abs(deltaX) > 10 || Math.abs(deltaY) > 10)) {
+                    isDragging = true
+                }
+
+                if (isDragging) {
+                    // 更新窗口位置
+                    params.x += deltaX.toInt()
+                    params.y += deltaY.toInt()
+                    windowManager.updateViewLayout(root, params)
+
+                    // 更新上次触摸位置
+                    lastTouchX = event.rawX
+                    lastTouchY = event.rawY
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                isDragging = false
+            }
+        }
+    }
+
+    private fun createNotification(): Notification {
+        val channelId = NOTIFICATION_CHANNEL_ID
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val channel = NotificationChannel(
+                channelId,
+                "AutoTask Overlay",
+                NotificationManager.IMPORTANCE_LOW
+            )
+            manager.createNotificationChannel(channel)
+        }
+        return Notification.Builder(this, channelId)
+            .setContentTitle("AutoTask")
+            .setContentText("Overlay running")
+            .setSmallIcon(android.R.drawable.ic_menu_view)
+            .build()
     }
 
     companion object {
-        private const val TAG = "OverlayService"
-        private const val EXTRA_SYSTEM_DIALOG_REASON = "reason"
-        private const val ACTION_CLOSE_SYSTEM_DIALOGS_COMPAT = "android.intent.action.CLOSE_SYSTEM_DIALOGS"
-        private val EXIT_SYSTEM_DIALOG_REASONS = setOf("homekey", "recentapps")
+        private const val ACTION_START = "org.avium.autotask.action.START_OVERLAY"
+        private const val ACTION_SET_TOUCH_PASSTHROUGH = "org.avium.autotask.action.SET_TOUCH_PASSTHROUGH"
+        private const val ACTION_STOP = "org.avium.autotask.action.STOP_OVERLAY"
 
-        const val ACTION_SHOW_OVERLAY = "org.avium.autotask.action.SHOW_OVERLAY"
-        const val ACTION_STOP_OVERLAY = "org.avium.autotask.action.STOP_OVERLAY"
-    }
-}
+        private const val DEFAULT_TARGET_PACKAGE = "com.android.dialer"
 
-private class OverlayComposeViewTreeOwner : SavedStateRegistryOwner, ViewModelStoreOwner {
-    private val lifecycleRegistry = LifecycleRegistry(this)
-    private val savedStateRegistryController = SavedStateRegistryController.create(this)
-    private val internalViewModelStore = ViewModelStore()
+        private const val NOTIFICATION_ID = 1001
+        private const val NOTIFICATION_CHANNEL_ID = "autotask_overlay"
 
-    override val lifecycle: Lifecycle
-        get() = lifecycleRegistry
+        fun start(context: Context, question: String?, packageName: String?, activityName: String? = null) {
+            val intent = Intent(context, FullScreenOverlayService::class.java).apply {
+                action = ACTION_START
+                putExtra(EXTRA_QUESTION, question)
+                putExtra(EXTRA_PACKAGE_NAME, packageName ?: DEFAULT_TARGET_PACKAGE)
+                putExtra(EXTRA_ACTIVITY_NAME, activityName)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
 
-    override val savedStateRegistry: SavedStateRegistry
-        get() = savedStateRegistryController.savedStateRegistry
+        fun setTouchPassthrough(context: Context, enabled: Boolean) {
+            val intent = Intent(context, FullScreenOverlayService::class.java).apply {
+                action = ACTION_SET_TOUCH_PASSTHROUGH
+                putExtra(EXTRA_TOUCH_PASSTHROUGH, enabled)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
 
-    override val viewModelStore: ViewModelStore
-        get() = internalViewModelStore
-
-    fun performCreate() {
-        savedStateRegistryController.performAttach()
-        savedStateRegistryController.performRestore(null)
-        lifecycleRegistry.currentState = Lifecycle.State.CREATED
-        lifecycleRegistry.currentState = Lifecycle.State.STARTED
-        lifecycleRegistry.currentState = Lifecycle.State.RESUMED
-    }
-
-    fun performDestroy() {
-        lifecycleRegistry.currentState = Lifecycle.State.STARTED
-        lifecycleRegistry.currentState = Lifecycle.State.CREATED
-        lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
-        internalViewModelStore.clear()
+        fun stop(context: Context) {
+            val intent = Intent(context, FullScreenOverlayService::class.java).apply {
+                action = ACTION_STOP
+            }
+            context.startService(intent)
+        }
     }
 }

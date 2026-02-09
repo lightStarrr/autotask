@@ -10,7 +10,31 @@
         android:name="android.permission.INJECT_EVENTS"
         tools:ignore="ProtectedPermissions" />
 
+    <uses-permission
+        android:name="android.permission.INTERNAL_SYSTEM_WINDOW"
+        tools:ignore="ProtectedPermissions" />
+
+    <uses-permission
+        android:name="android.permission.CAPTURE_VIDEO_OUTPUT"
+        tools:ignore="ProtectedPermissions" />
+
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- 允许查询可启动的应用 (Android 11+) -->
+    <queries>
+        <!-- 查询所有启动器应用 -->
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <!-- 查询拨号应用 -->
+        <intent>
+            <action android:name="android.intent.action.DIAL" />
+            <data android:scheme="tel" />
+        </intent>
+    </queries>
 
     <application
         android:allowBackup="true"
@@ -36,6 +60,7 @@
 
         <service
             android:name=".FullScreenOverlayService"
+            android:foregroundServiceType="dataSync"
             android:exported="false" />
     </application>
 
