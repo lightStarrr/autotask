@@ -22,6 +22,8 @@ import android.view.TextureView
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
+import android.animation.ValueAnimator
+import android.view.animation.DecelerateInterpolator
 
 import org.avium.autotask.IntentKeys.EXTRA_PACKAGE_NAME
 import org.avium.autotask.IntentKeys.EXTRA_QUESTION
@@ -37,7 +39,9 @@ class FullScreenOverlayService : Service() {
     private lateinit var inputManager: InputManager
 
     private var overlayRoot: FrameLayout? = null
+    private var contentContainer: FrameLayout? = null
     private var textureView: TextureView? = null
+    private var bottomHandleBar: View? = null
     private var overlayParams: WindowManager.LayoutParams? = null
 
     private var virtualDisplay: VirtualDisplay? = null
@@ -48,6 +52,15 @@ class FullScreenOverlayService : Service() {
     private var lastTouchX = 0f
     private var lastTouchY = 0f
     private var isDragging = false
+    private var dragStartY = 0f
+    private var dragDistance = 0f
+
+    // 窗口大小状态
+    private var isMinimized = false
+    private var largeWindowWidth = 0
+    private var largeWindowHeight = 0
+    private var screenHeight = 0
+    private var isAnimating = false
 
     private var question: String? = null
     private var targetPackage: String = DEFAULT_TARGET_PACKAGE
@@ -83,6 +96,9 @@ class FullScreenOverlayService : Service() {
                 val enabled = intent.getBooleanExtra(EXTRA_TOUCH_PASSTHROUGH, false)
                 setTouchPassthroughInternal(enabled)
             }
+            ACTION_TOGGLE_SIZE -> {
+                toggleWindowSize()
+            }
             ACTION_STOP -> {
                 stopSelf()
             }
@@ -98,7 +114,9 @@ class FullScreenOverlayService : Service() {
             Log.w(tag, "Failed to remove overlay", e)
         }
         overlayRoot = null
+        contentContainer = null
         textureView = null
+        bottomHandleBar = null
         virtualDisplay?.release()
         virtualDisplay = null
     }
@@ -113,13 +131,44 @@ class FullScreenOverlayService : Service() {
 
         // 获取屏幕尺寸并计算窗口大小（屏幕的 70%）
         val displayMetrics = resources.displayMetrics
-        val windowWidth = (displayMetrics.widthPixels * 0.7).toInt()
-        val windowHeight = (displayMetrics.heightPixels * 0.7).toInt()
+        screenHeight = displayMetrics.heightPixels
+        largeWindowWidth = (displayMetrics.widthPixels * 0.7).toInt()
+        largeWindowHeight = (displayMetrics.heightPixels * 0.7).toInt()
 
-        overlayParams = OverlayEffect.buildLayoutParams(touchPassthrough, windowWidth, windowHeight)
+        val handleBarHeight = (4 * displayMetrics.density).toInt()
+        val handleBarMargin = (16 * displayMetrics.density).toInt()
+        val extraSpace = handleBarHeight + handleBarMargin * 2
+
+        // 窗口大小固定为大窗尺寸，通过缩放实现大小变化
+        val initialWidth = largeWindowWidth
+        val initialHeight = largeWindowHeight + extraSpace
+
+        overlayParams = OverlayEffect.buildLayoutParams(touchPassthrough, initialWidth, initialHeight)
         overlayRoot = FrameLayout(this).apply {
-            setBackgroundColor(0xFF000000.toInt())
+            setBackgroundColor(0x00000000) // 透明背景
+            // 设置缩放中心点在中心
+            pivotX = (initialWidth / 2).toFloat()
+            pivotY = (initialHeight / 2).toFloat()
+            // 设置初始缩放状态
+            val scale = if (isMinimized) MINIMIZED_SIZE.toFloat() / largeWindowWidth.toFloat() else 1f
+            scaleX = scale
+            scaleY = scale
+            setOnTouchListener { view, event ->
+                handleTouch(event)
+                true // 消费事件
+            }
         }
+
+        // 内容容器（黑色背景）
+        contentContainer = FrameLayout(this).apply {
+            if (isMinimized) {
+                setBackgroundResource(R.drawable.rounded_overlay_bg)
+                clipToOutline = true
+            } else {
+                setBackgroundColor(0xFF000000.toInt())
+            }
+        }
+
         textureView = TextureView(this).apply {
             isOpaque = false
             surfaceTextureListener = object : TextureView.SurfaceTextureListener {
@@ -147,26 +196,39 @@ class FullScreenOverlayService : Service() {
 
                 override fun onSurfaceTextureUpdated(surfaceTexture: android.graphics.SurfaceTexture) = Unit
             }
-            setOnTouchListener { view, event ->
-                if (touchPassthrough) {
-                    // 拖动模式：允许拖动悬浮窗
-                    handleDragEvent(event)
-                    true // 消费事件
-                } else {
-                    // 非穿透模式：注入触摸事件到虚拟显示器
-                    handleTouchEvent(event)
-                    true // 消费事件
-                }
-            }
         }
 
-        overlayRoot?.addView(
+        contentContainer?.addView(
             textureView,
             FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
         )
+
+        // 将内容容器添加到根布局（始终保持虚拟显示器的分辨率）
+        val contentParams = FrameLayout.LayoutParams(
+            largeWindowWidth,
+            largeWindowHeight
+        ).apply {
+            gravity = android.view.Gravity.TOP or android.view.Gravity.CENTER_HORIZONTAL
+        }
+        overlayRoot?.addView(contentContainer, contentParams)
+
+        // 添加底部横条（在大窗模式下显示，位于内容容器下方）
+        if (!isMinimized) {
+            bottomHandleBar = View(this).apply {
+                setBackgroundResource(R.drawable.bottom_handle_bar)
+                visibility = View.VISIBLE
+            }
+            val handleWidth = (50 * displayMetrics.density).toInt()
+
+            val handleParams = FrameLayout.LayoutParams(handleWidth, handleBarHeight).apply {
+                gravity = android.view.Gravity.BOTTOM or android.view.Gravity.CENTER_HORIZONTAL
+                bottomMargin = handleBarMargin
+            }
+            overlayRoot?.addView(bottomHandleBar, handleParams)
+        }
 
         windowManager.addView(overlayRoot, overlayParams)
     }
@@ -323,9 +385,58 @@ class FullScreenOverlayService : Service() {
         windowManager.updateViewLayout(root, newParams)
     }
 
-    private fun handleTouchEvent(event: MotionEvent) {
+    private fun handleTouch(event: MotionEvent) {
+        if (isAnimating) return // 动画期间忽略触摸
+
+        if (isMinimized) {
+            // 小窗模式：处理拖动和单击切换
+            handleMinimizedWindowTouch(event)
+        } else {
+            // 大窗模式：检查是否点击底部横条
+            val handleBar = bottomHandleBar
+            if (handleBar != null && isTouchOnHandleBar(event, handleBar)) {
+                handleLargeWindowDrag(event)
+            } else {
+                // 点击内容区域
+                if (!touchPassthrough) {
+                    // 注入触摸事件到虚拟显示器
+                    handleTouchEventForContent(event)
+                }
+                // touchPassthrough = true 时不做任何处理（大窗固定不动）
+            }
+        }
+    }
+
+    private fun handleTouchEventForContent(event: MotionEvent) {
+        val container = contentContainer ?: return
         val display = virtualDisplay?.display ?: return
         val displayId = display.displayId
+
+        // 获取当前缩放比例
+        val scale = container.scaleX
+
+        // 将触摸坐标转换为相对于 contentContainer 的坐标
+        val location = IntArray(2)
+        container.getLocationOnScreen(location)
+
+        // 计算缩放后的实际显示区域
+        val scaledWidth = (container.width * scale).toInt()
+        val scaledHeight = (container.height * scale).toInt()
+        val scaledLeft = location[0] + (container.width - scaledWidth) / 2
+        val scaledTop = location[1] + (container.height - scaledHeight) / 2
+
+        // 转换为相对于缩放后区域的坐标
+        val relativeX = event.rawX - scaledLeft
+        val relativeY = event.rawY - scaledTop
+
+        // 检查是否在缩放后的显示范围内
+        if (relativeX < 0 || relativeX > scaledWidth || relativeY < 0 || relativeY > scaledHeight) {
+            return
+        }
+
+        // 转换为虚拟显示器的实际坐标（考虑缩放）
+        val x = relativeX / scale
+        val y = relativeY / scale
 
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
@@ -334,8 +445,8 @@ class FullScreenOverlayService : Service() {
                     inputManager,
                     displayId,
                     MotionEvent.ACTION_DOWN,
-                    event.x,
-                    event.y,
+                    x,
+                    y,
                     touchDownTime
                 )
             }
@@ -344,8 +455,8 @@ class FullScreenOverlayService : Service() {
                     inputManager,
                     displayId,
                     MotionEvent.ACTION_MOVE,
-                    event.x,
-                    event.y,
+                    x,
+                    y,
                     touchDownTime
                 )
             }
@@ -354,8 +465,8 @@ class FullScreenOverlayService : Service() {
                     inputManager,
                     displayId,
                     MotionEvent.ACTION_UP,
-                    event.x,
-                    event.y,
+                    x,
+                    y,
                     touchDownTime
                 )
             }
@@ -364,27 +475,108 @@ class FullScreenOverlayService : Service() {
                     inputManager,
                     displayId,
                     MotionEvent.ACTION_CANCEL,
-                    event.x,
-                    event.y,
+                    x,
+                    y,
                     touchDownTime
                 )
             }
         }
     }
 
-    private fun handleDragEvent(event: MotionEvent) {
+    private fun isTouchOnHandleBar(event: MotionEvent, handleBar: View): Boolean {
+        val location = IntArray(2)
+        handleBar.getLocationOnScreen(location)
+        val handleLeft = location[0]
+        val handleTop = location[1]
+        val handleRight = handleLeft + handleBar.width
+        val handleBottom = handleTop + handleBar.height
+
+        // 扩大触摸区域，提高可用性
+        val touchPadding = (20 * resources.displayMetrics.density).toInt()
+        return event.rawX >= handleLeft - touchPadding &&
+                event.rawX <= handleRight + touchPadding &&
+                event.rawY >= handleTop - touchPadding &&
+                event.rawY <= handleBottom + touchPadding
+    }
+
+    private fun handleLargeWindowDrag(event: MotionEvent) {
         val params = overlayParams ?: return
         val root = overlayRoot ?: return
 
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
-                // 记录初始触摸位置
+                dragStartY = event.rawY
+                dragDistance = 0f
+                isDragging = false
+            }
+            MotionEvent.ACTION_MOVE -> {
+                dragDistance = dragStartY - event.rawY // 向上为正
+                if (!isDragging && Math.abs(dragDistance) > 10) {
+                    isDragging = true
+                }
+
+                if (isDragging && dragDistance > 0) {
+                    // 实时更新窗口大小和位置
+                    updateWindowDuringDrag(dragDistance)
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (isDragging) {
+                    val threshold = screenHeight * 0.25f
+                    if (dragDistance >= threshold) {
+                        // 超过阈值，动画缩小为小窗
+                        animateToMinimized()
+                    } else {
+                        // 未超过阈值，动画恢复原状
+                        animateToLarge()
+                    }
+                }
+                isDragging = false
+            }
+        }
+    }
+
+    private fun updateWindowDuringDrag(distance: Float) {
+        val params = overlayParams ?: return
+        val root = overlayRoot ?: return
+
+        // 计算缩放比例（从 1.0 到 MINIMIZED_SIZE/largeWindowWidth）
+        val maxDistance = screenHeight * 0.25f
+        val progress = (distance / maxDistance).coerceIn(0f, 1f)
+
+        val targetScale = MINIMIZED_SIZE.toFloat() / largeWindowWidth.toFloat()
+        val scale = 1f - (1f - targetScale) * progress
+
+        // 对整个窗口进行缩放（包括内容和小横条）
+        root.scaleX = scale
+        root.scaleY = scale
+
+        // 计算窗口位置，使得底部跟随手指
+        // 当pivot在中心时，窗口底部Y坐标 = params.y + initialHeight/2 * (1 + scale)
+        // 我们希望底部在 initialHeight - distance
+        // 所以 params.y = initialHeight/2 * (1 - scale) - distance
+        val displayMetrics = resources.displayMetrics
+        val handleBarHeight = (4 * displayMetrics.density).toInt()
+        val handleBarMargin = (16 * displayMetrics.density).toInt()
+        val extraSpace = handleBarHeight + handleBarMargin * 2
+        val initialHeight = largeWindowHeight + extraSpace
+
+        params.y = (initialHeight / 2f * (1f - scale) - distance).toInt()
+
+        windowManager.updateViewLayout(root, params)
+    }
+
+    private fun handleMinimizedWindowTouch(event: MotionEvent) {
+        val params = overlayParams ?: return
+        val root = overlayRoot ?: return
+
+        when (event.action) {
+            MotionEvent.ACTION_DOWN -> {
                 lastTouchX = event.rawX
                 lastTouchY = event.rawY
                 isDragging = false
             }
             MotionEvent.ACTION_MOVE -> {
-                // 计算移动距离
                 val deltaX = event.rawX - lastTouchX
                 val deltaY = event.rawY - lastTouchY
 
@@ -399,14 +591,138 @@ class FullScreenOverlayService : Service() {
                     params.y += deltaY.toInt()
                     windowManager.updateViewLayout(root, params)
 
-                    // 更新上次触摸位置
                     lastTouchX = event.rawX
                     lastTouchY = event.rawY
                 }
             }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+            MotionEvent.ACTION_UP -> {
+                if (!isDragging) {
+                    // 单击：切换到大窗模式
+                    animateToLarge()
+                }
                 isDragging = false
             }
+            MotionEvent.ACTION_CANCEL -> {
+                isDragging = false
+            }
+        }
+    }
+
+    private fun animateToMinimized() {
+        val params = overlayParams ?: return
+        val root = overlayRoot ?: return
+        val container = contentContainer ?: return
+
+        isAnimating = true
+
+        val startY = params.y
+        val startX = params.x
+        val startScale = root.scaleX
+
+        val animator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 300
+            interpolator = DecelerateInterpolator()
+            addUpdateListener { animation ->
+                val progress = animation.animatedValue as Float
+
+                // 计算目标缩放
+                val targetScale = MINIMIZED_SIZE.toFloat() / largeWindowWidth.toFloat()
+                val currentScale = startScale + (targetScale - startScale) * progress
+
+                // 计算目标位置（移到屏幕右侧中间偏上）
+                val targetX = (screenHeight * 0.3f).toInt()
+                val targetY = (screenHeight * 0.3f).toInt()
+
+                val currentX = (startX + (targetX - startX) * progress).toInt()
+                val currentY = (startY + (targetY - startY) * progress).toInt()
+
+                // 对整个窗口进行缩放
+                root.scaleX = currentScale
+                root.scaleY = currentScale
+
+                // 更新窗口位置
+                params.x = currentX
+                params.y = currentY
+
+                windowManager.updateViewLayout(root, params)
+            }
+            addListener(object : android.animation.Animator.AnimatorListener {
+                override fun onAnimationStart(animation: android.animation.Animator) {}
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    isMinimized = true
+                    container.setBackgroundResource(R.drawable.rounded_overlay_bg)
+                    container.clipToOutline = true
+                    bottomHandleBar?.visibility = View.GONE
+                    isAnimating = false
+                }
+                override fun onAnimationCancel(animation: android.animation.Animator) {
+                    isAnimating = false
+                }
+                override fun onAnimationRepeat(animation: android.animation.Animator) {}
+            })
+        }
+        animator.start()
+    }
+
+    private fun animateToLarge() {
+        val params = overlayParams ?: return
+        val root = overlayRoot ?: return
+        val container = contentContainer ?: return
+
+        isAnimating = true
+
+        val startY = params.y
+        val startX = params.x
+        val startScale = root.scaleX
+
+        val animator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 300
+            interpolator = DecelerateInterpolator()
+            addUpdateListener { animation ->
+                val progress = animation.animatedValue as Float
+
+                // 计算当前缩放比例（从当前缩放到 1.0）
+                val currentScale = startScale + (1f - startScale) * progress
+
+                // 移动到屏幕中心
+                val currentX = (startX - startX * progress).toInt()
+                val currentY = (startY - startY * progress).toInt()
+
+                // 对整个窗口进行缩放
+                root.scaleX = currentScale
+                root.scaleY = currentScale
+
+                // 更新窗口位置
+                params.x = currentX
+                params.y = currentY
+
+                windowManager.updateViewLayout(root, params)
+            }
+            addListener(object : android.animation.Animator.AnimatorListener {
+                override fun onAnimationStart(animation: android.animation.Animator) {}
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    isMinimized = false
+                    container.setBackgroundColor(0xFF000000.toInt())
+                    container.clipToOutline = false
+                    root.scaleX = 1f
+                    root.scaleY = 1f
+                    bottomHandleBar?.visibility = View.VISIBLE
+                    isAnimating = false
+                }
+                override fun onAnimationCancel(animation: android.animation.Animator) {
+                    isAnimating = false
+                }
+                override fun onAnimationRepeat(animation: android.animation.Animator) {}
+            })
+        }
+        animator.start()
+    }
+
+    private fun toggleWindowSize() {
+        if (isMinimized) {
+            animateToLarge()
+        } else {
+            animateToMinimized()
         }
     }
 
@@ -431,12 +747,15 @@ class FullScreenOverlayService : Service() {
     companion object {
         private const val ACTION_START = "org.avium.autotask.action.START_OVERLAY"
         private const val ACTION_SET_TOUCH_PASSTHROUGH = "org.avium.autotask.action.SET_TOUCH_PASSTHROUGH"
+        private const val ACTION_TOGGLE_SIZE = "org.avium.autotask.action.TOGGLE_SIZE"
         private const val ACTION_STOP = "org.avium.autotask.action.STOP_OVERLAY"
 
         private const val DEFAULT_TARGET_PACKAGE = "com.android.dialer"
 
         private const val NOTIFICATION_ID = 1001
         private const val NOTIFICATION_CHANNEL_ID = "autotask_overlay"
+
+        private const val MINIMIZED_SIZE = 200 // 小窗大小（像素）
 
         fun start(context: Context, question: String?, packageName: String?, activityName: String? = null) {
             val intent = Intent(context, FullScreenOverlayService::class.java).apply {
@@ -456,6 +775,17 @@ class FullScreenOverlayService : Service() {
             val intent = Intent(context, FullScreenOverlayService::class.java).apply {
                 action = ACTION_SET_TOUCH_PASSTHROUGH
                 putExtra(EXTRA_TOUCH_PASSTHROUGH, enabled)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
+
+        fun toggleWindowSize(context: Context) {
+            val intent = Intent(context, FullScreenOverlayService::class.java).apply {
+                action = ACTION_TOGGLE_SIZE
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
