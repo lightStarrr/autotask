@@ -52,6 +52,7 @@ class FullScreenOverlayService : Service() {
     private var lastTouchX = 0f
     private var lastTouchY = 0f
     private var isDragging = false
+    private var isDraggingHandleBar = false // 标记是否正在拖动大窗横条
     private var dragStartY = 0f
     private var dragDistance = 0f
 
@@ -392,9 +393,10 @@ class FullScreenOverlayService : Service() {
             // 小窗模式：处理拖动和单击切换
             handleMinimizedWindowTouch(event)
         } else {
-            // 大窗模式：检查是否点击底部横条
+            // 大窗模式：检查是否正在拖动横条或点击横条
             val handleBar = bottomHandleBar
-            if (handleBar != null && isTouchOnHandleBar(event, handleBar)) {
+            if (isDraggingHandleBar || (handleBar != null && isTouchOnHandleBar(event, handleBar))) {
+                // 一旦开始拖动横条，后续的 MOVE 事件都由 handleLargeWindowDrag 处理
                 handleLargeWindowDrag(event)
             } else {
                 // 点击内容区域
@@ -508,6 +510,7 @@ class FullScreenOverlayService : Service() {
                 dragStartY = event.rawY
                 dragDistance = 0f
                 isDragging = false
+                isDraggingHandleBar = true // 标记开始拖动横条
             }
             MotionEvent.ACTION_MOVE -> {
                 dragDistance = dragStartY - event.rawY // 向上为正
@@ -532,6 +535,7 @@ class FullScreenOverlayService : Service() {
                     }
                 }
                 isDragging = false
+                isDraggingHandleBar = false // 清除拖动标志
             }
         }
     }
