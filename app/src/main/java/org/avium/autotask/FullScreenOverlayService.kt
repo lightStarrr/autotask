@@ -207,8 +207,12 @@ class FullScreenOverlayService : Service() {
         }
 
         calculateGeometry()
+        val trustedOverlay = hasInternalSystemWindowPermission()
 
-        backgroundParams = OverlayEffect.buildBackgroundLayoutParams(touchable = true)
+        backgroundParams = OverlayEffect.buildBackgroundLayoutParams(
+            touchable = true,
+            trustedOverlay = trustedOverlay
+        )
         backgroundLayer = FrameLayout(this).apply {
             setBackgroundColor(0x00000000)
             setOnTouchListener { _, event ->
@@ -219,7 +223,7 @@ class FullScreenOverlayService : Service() {
 
         contentParams = OverlayEffect.buildContentLayoutParams(
             touchable = true,
-            trustedOverlay = hasInternalSystemWindowPermission(),
+            trustedOverlay = trustedOverlay,
             width = largeWindowWidth,
             height = largeWindowHeight
         ).apply {
@@ -309,7 +313,11 @@ class FullScreenOverlayService : Service() {
             }
         )
 
-        miniTouchParams = OverlayEffect.buildMiniTouchLayoutParams(miniSize, miniHeight).apply {
+        miniTouchParams = OverlayEffect.buildMiniTouchLayoutParams(
+            width = miniSize,
+            height = miniHeight,
+            trustedOverlay = trustedOverlay
+        ).apply {
             val defaultMini = resolveMiniTargetPosition()
             x = defaultMini.first
             y = defaultMini.second
@@ -1120,6 +1128,7 @@ class FullScreenOverlayService : Service() {
     private fun applyLargeVisualState(immediate: Boolean) {
         overlayState = OverlayState.LARGE
 
+        backgroundLayer?.visibility = View.VISIBLE
         clearMaskedVisuals()
         bottomHandleBar?.visibility = View.VISIBLE
 
@@ -1145,6 +1154,7 @@ class FullScreenOverlayService : Service() {
     }
 
     private fun setMiniVisualState(masked: Boolean) {
+        backgroundLayer?.visibility = View.GONE
         bottomHandleBar?.visibility = View.GONE
 
         contentContainer?.setBackgroundResource(R.drawable.rounded_overlay_bg)

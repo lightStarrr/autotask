@@ -9,12 +9,16 @@ object OverlayEffect {
         WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
             WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED or
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
 
-    fun buildBackgroundLayoutParams(touchable: Boolean): WindowManager.LayoutParams {
+    fun buildBackgroundLayoutParams(
+        touchable: Boolean,
+        trustedOverlay: Boolean
+    ): WindowManager.LayoutParams {
         return createParams(
             touchable = touchable,
-            type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            type = resolveWindowType(trustedOverlay),
             width = WindowManager.LayoutParams.MATCH_PARENT,
             height = WindowManager.LayoutParams.MATCH_PARENT
         )
@@ -26,26 +30,33 @@ object OverlayEffect {
         width: Int,
         height: Int
     ): WindowManager.LayoutParams {
-        val windowType = if (trustedOverlay) {
-            WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
-        } else {
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        }
         return createParams(
             touchable = touchable,
-            type = windowType,
+            type = resolveWindowType(trustedOverlay),
             width = width,
             height = height
         )
     }
 
-    fun buildMiniTouchLayoutParams(width: Int, height: Int): WindowManager.LayoutParams {
+    fun buildMiniTouchLayoutParams(
+        width: Int,
+        height: Int,
+        trustedOverlay: Boolean
+    ): WindowManager.LayoutParams {
         return createParams(
             touchable = true,
-            type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            type = resolveWindowType(trustedOverlay),
             width = width,
             height = height
         )
+    }
+
+    private fun resolveWindowType(trustedOverlay: Boolean): Int {
+        return if (trustedOverlay) {
+            WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
+        } else {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        }
     }
 
     private fun createParams(
