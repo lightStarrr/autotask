@@ -102,7 +102,7 @@ class FullScreenOverlayService : Service() {
                 toggleWindowSize()
             }
             ACTION_STOP -> {
-                launchAutoCloseActivityAndStop()
+                stopVirtualDisplayAndService()
             }
         }
         return START_STICKY
@@ -290,47 +290,26 @@ class FullScreenOverlayService : Service() {
     }
 
     /**
-     * 在虚拟显示器上启动 AutoCloseActivity，然后关闭服务
-     * AutoCloseActivity 会占据虚拟显示器，并在虚拟显示器释放时自动关闭
+     * 强制停止虚拟显示器上的应用，然后关闭服务
      */
-    private fun launchAutoCloseActivityAndStop() {
-        val display = virtualDisplay?.display
-        if (display != null) {
-            val displayId = display.displayId
-
-            // 尝试强制停止虚拟显示器上的第三方应用
-            if (targetPackage != DEFAULT_TARGET_PACKAGE) {
-                try {
-                    Log.d(tag, "Attempting to force stop package: $targetPackage")
-                    // 使用反射调用 ActivityManager.forceStopPackage（需要系统权限）
-                    val method = activityManager.javaClass.getMethod("forceStopPackage", String::class.java)
-                    method.invoke(activityManager, targetPackage)
-                    Log.d(tag, "Successfully force stopped $targetPackage")
-                } catch (e: Exception) {
-                    Log.w(tag, "Failed to force stop package (may need system permissions)", e)
-                }
-            }
-
-            // 启动 AutoCloseActivity 作为备用方案
-            val displayContext = createDisplayContext(display)
-            val options = android.app.ActivityOptions.makeBasic()
-                .setLaunchDisplayId(displayId)
-            val intent = Intent(this, AutoCloseActivity::class.java).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK)
-            }
+    private fun stopVirtualDisplayAndService() {
+        // 强制停止虚拟显示器上的第三方应用
+        if (targetPackage != DEFAULT_TARGET_PACKAGE) {
             try {
-                displayContext.startActivity(intent, options.toBundle())
-                Log.d(tag, "Launched AutoCloseActivity on virtual display $displayId")
+                Log.d(tag, "Force stopping package: $targetPackage")
+                // 使用反射调用 ActivityManager.forceStopPackage（需要 FORCE_STOP_PACKAGES 权限）
+                val method = activityManager.javaClass.getMethod("forceStopPackage", String::class.java)
+                method.invoke(activityManager, targetPackage)
+                Log.d(tag, "Successfully force stopped $targetPackage")
             } catch (e: Exception) {
-                Log.e(tag, "Failed to start AutoCloseActivity", e)
+                Log.e(tag, "Failed to force stop package", e)
             }
         }
 
-        // 延迟关闭服务
+        // 延迟关闭服务，确保应用有足够时间停止
         Handler(Looper.getMainLooper()).postDelayed({
             stopSelf()
-        }, 200)
+        }, 500)
     }
 
     private fun resolveLaunchIntent(): Intent? {

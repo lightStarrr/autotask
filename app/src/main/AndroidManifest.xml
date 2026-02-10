@@ -62,18 +62,6 @@
             </intent-filter>
         </activity>
 
-        <activity
-            android:name=".AutoCloseActivity"
-            android:excludeFromRecents="true"
-            android:exported="false"
-            android:process=":autoclose"
-            android:taskAffinity="org.avium.autotask.autoclose"
-            android:finishOnTaskLaunch="true"
-            android:noHistory="true"
-            android:resizeableActivity="true"
-            android:launchMode="singleTask"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
-
         <service
             android:name=".FullScreenOverlayService"
             android:foregroundServiceType="dataSync"
