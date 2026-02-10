@@ -1,5 +1,6 @@
 package org.avium.autotask
 
+import android.app.ActivityManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -10,7 +11,9 @@ import android.content.Intent
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.hardware.input.InputManager
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.SystemClock
 import android.content.pm.ServiceInfo
 import android.util.Log
@@ -37,6 +40,7 @@ class FullScreenOverlayService : Service() {
     private lateinit var windowManager: WindowManager
     private lateinit var displayManager: DisplayManager
     private lateinit var inputManager: InputManager
+    private lateinit var activityManager: ActivityManager
 
     private var overlayRoot: FrameLayout? = null
     private var contentContainer: FrameLayout? = null
@@ -72,6 +76,7 @@ class FullScreenOverlayService : Service() {
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
         inputManager = getSystemService(Context.INPUT_SERVICE) as InputManager
+        activityManager = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         val notification = createNotification()
         startForeground(
             NOTIFICATION_ID,
@@ -97,7 +102,7 @@ class FullScreenOverlayService : Service() {
                 toggleWindowSize()
             }
             ACTION_STOP -> {
-                stopSelf()
+                launchAutoCloseActivityAndStop()
             }
         }
         return START_STICKY
@@ -114,6 +119,8 @@ class FullScreenOverlayService : Service() {
         contentContainer = null
         textureView = null
         bottomHandleBar = null
+
+        // 释放虚拟显示器
         virtualDisplay?.release()
         virtualDisplay = null
     }
@@ -280,6 +287,50 @@ class FullScreenOverlayService : Service() {
                 Log.e(tag, "Failed to start target activity with $intent", e)
             }
         }
+    }
+
+    /**
+     * 在虚拟显示器上启动 AutoCloseActivity，然后关闭服务
+     * AutoCloseActivity 会占据虚拟显示器，并在虚拟显示器释放时自动关闭
+     */
+    private fun launchAutoCloseActivityAndStop() {
+        val display = virtualDisplay?.display
+        if (display != null) {
+            val displayId = display.displayId
+
+            // 尝试强制停止虚拟显示器上的第三方应用
+            if (targetPackage != DEFAULT_TARGET_PACKAGE) {
+                try {
+                    Log.d(tag, "Attempting to force stop package: $targetPackage")
+                    // 使用反射调用 ActivityManager.forceStopPackage（需要系统权限）
+                    val method = activityManager.javaClass.getMethod("forceStopPackage", String::class.java)
+                    method.invoke(activityManager, targetPackage)
+                    Log.d(tag, "Successfully force stopped $targetPackage")
+                } catch (e: Exception) {
+                    Log.w(tag, "Failed to force stop package (may need system permissions)", e)
+                }
+            }
+
+            // 启动 AutoCloseActivity 作为备用方案
+            val displayContext = createDisplayContext(display)
+            val options = android.app.ActivityOptions.makeBasic()
+                .setLaunchDisplayId(displayId)
+            val intent = Intent(this, AutoCloseActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK)
+            }
+            try {
+                displayContext.startActivity(intent, options.toBundle())
+                Log.d(tag, "Launched AutoCloseActivity on virtual display $displayId")
+            } catch (e: Exception) {
+                Log.e(tag, "Failed to start AutoCloseActivity", e)
+            }
+        }
+
+        // 延迟关闭服务
+        Handler(Looper.getMainLooper()).postDelayed({
+            stopSelf()
+        }, 200)
     }
 
     private fun resolveLaunchIntent(): Intent? {

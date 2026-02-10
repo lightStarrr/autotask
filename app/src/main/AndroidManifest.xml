@@ -18,6 +18,10 @@
         android:name="android.permission.CAPTURE_VIDEO_OUTPUT"
         tools:ignore="ProtectedPermissions" />
 
+    <uses-permission
+        android:name="android.permission.FORCE_STOP_PACKAGES"
+        tools:ignore="ProtectedPermissions" />
+
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
@@ -57,6 +61,18 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".AutoCloseActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:process=":autoclose"
+            android:taskAffinity="org.avium.autotask.autoclose"
+            android:finishOnTaskLaunch="true"
+            android:noHistory="true"
+            android:resizeableActivity="true"
+            android:launchMode="singleTask"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <service
             android:name=".FullScreenOverlayService"
