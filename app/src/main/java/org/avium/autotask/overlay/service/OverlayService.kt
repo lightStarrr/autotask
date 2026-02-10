@@ -1,14 +1,11 @@
-package org.avium.autotask
+package org.avium.autotask.overlay.service
 
-import android.animation.Animator
-import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.app.ActivityManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
-import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -32,26 +29,57 @@ import android.view.View
 import android.view.ViewOutlineProvider
 import android.view.WindowInsets
 import android.view.WindowManager
-import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
-import androidx.core.net.toUri
-import org.avium.autotask.IntentKeys.EXTRA_ACTIVITY_NAME
-import org.avium.autotask.IntentKeys.EXTRA_PACKAGE_NAME
-import org.avium.autotask.IntentKeys.EXTRA_QUESTION
-import org.avium.autotask.IntentKeys.EXTRA_TOUCH_PASSTHROUGH
-import org.avium.autotask.util.InputInjector
+import org.avium.autotask.R
+import org.avium.autotask.overlay.animation.OverlayAnimator
+import org.avium.autotask.overlay.contract.OverlayContract
+import org.avium.autotask.overlay.core.OverlayDockSide
+import org.avium.autotask.overlay.core.OverlayEffect
+import org.avium.autotask.overlay.core.OverlayEvent
+import org.avium.autotask.overlay.core.OverlayMode
+import org.avium.autotask.overlay.core.OverlayReducer
+import org.avium.autotask.overlay.core.OverlayState
+import org.avium.autotask.overlay.core.OverlayStore
+import org.avium.autotask.overlay.core.OverlayTouchSubState
+import org.avium.autotask.overlay.gesture.OverlayGestureInterpreter
+import org.avium.autotask.overlay.input.DisplayTouchInjector
+import org.avium.autotask.overlay.launch.TargetIntentResolver
+import org.avium.autotask.overlay.launch.TargetLaunchRequest
+import org.avium.autotask.overlay.launch.TargetLauncher
+import org.avium.autotask.overlay.log.OverlayTraceLogger
+import org.avium.autotask.overlay.usecase.SetTouchPassthroughUseCase
+import org.avium.autotask.overlay.usecase.StartOverlayUseCase
+import org.avium.autotask.overlay.usecase.StopOverlayUseCase
+import org.avium.autotask.overlay.usecase.ToggleOverlaySizeUseCase
+import org.avium.autotask.overlay.window.OverlayGeometryCalculator
+import org.avium.autotask.overlay.window.OverlayWindowHost
+import org.avium.autotask.overlay.window.OverlayWindowParamsFactory
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.pow
 import kotlin.math.roundToInt
 
-class FullScreenOverlayService : Service() {
-    private val tag = "FullScreenOverlayService"
+class OverlayService : Service() {
+    private val tag = "OverlayService"
+    private val traceLogger = OverlayTraceLogger(enabled = true)
+    private val gestureInterpreter = OverlayGestureInterpreter()
+    private val overlayAnimator = OverlayAnimator()
 
     private lateinit var windowManager: WindowManager
     private lateinit var displayManager: DisplayManager
     private lateinit var inputManager: InputManager
     private lateinit var activityManager: ActivityManager
+    private lateinit var displayTouchInjector: DisplayTouchInjector
+    private lateinit var targetIntentResolver: TargetIntentResolver
+    private lateinit var targetLauncher: TargetLauncher
+    private lateinit var geometryCalculator: OverlayGeometryCalculator
+    private lateinit var windowHost: OverlayWindowHost
+
+    private lateinit var overlayStore: OverlayStore
+    private lateinit var startOverlayUseCase: StartOverlayUseCase
+    private lateinit var setTouchPassthroughUseCase: SetTouchPassthroughUseCase
+    private lateinit var toggleOverlaySizeUseCase: ToggleOverlaySizeUseCase
+    private lateinit var stopOverlayUseCase: StopOverlayUseCase
 
     private var backgroundLayer: FrameLayout? = null
     private var backgroundParams: WindowManager.LayoutParams? = null
@@ -73,9 +101,8 @@ class FullScreenOverlayService : Service() {
 
     private var virtualDisplay: VirtualDisplay? = null
 
-    private var overlayState = OverlayState.LARGE
+    private var windowMode = WindowMode.LARGE
     private var dockSide = DockSide.RIGHT
-    private var activeAnimator: ValueAnimator? = null
     private var isAnimating = false
 
     private var touchPassthrough = false
@@ -117,12 +144,12 @@ class FullScreenOverlayService : Service() {
     private var isMiniDragging = false
 
     private var question: String? = null
-    private var targetPackage: String = DEFAULT_TARGET_PACKAGE
+    private var targetPackage: String = OverlayContract.DEFAULT_TARGET_PACKAGE
     private var targetActivity: String? = null
 
     private val contentOutlineProvider = object : ViewOutlineProvider() {
         override fun getOutline(view: View, outline: Outline) {
-            if (overlayState == OverlayState.LARGE) {
+            if (windowMode == WindowMode.LARGE) {
                 outline.setRect(0, 0, view.width, view.height)
                 return
             }
@@ -141,6 +168,26 @@ class FullScreenOverlayService : Service() {
         inputManager = getSystemService(Context.INPUT_SERVICE) as InputManager
         activityManager = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
 
+        displayTouchInjector = DisplayTouchInjector(inputManager)
+        targetIntentResolver = TargetIntentResolver(packageManager, tag)
+        targetLauncher = TargetLauncher(this, tag)
+        geometryCalculator = OverlayGeometryCalculator()
+        windowHost = OverlayWindowHost(windowManager, tag)
+
+        overlayStore =
+            OverlayStore(
+                initialState = OverlayState(),
+                reducer = OverlayReducer(),
+                effectExecutor = ::executeOverlayEffect,
+                onStateChanged = { state, event -> traceLogger.log(state, event) },
+            )
+        startOverlayUseCase = StartOverlayUseCase(overlayStore)
+        setTouchPassthroughUseCase = SetTouchPassthroughUseCase(overlayStore)
+        toggleOverlaySizeUseCase = ToggleOverlaySizeUseCase(overlayStore)
+        stopOverlayUseCase = StopOverlayUseCase(overlayStore)
+        overlayStore.dispatch(OverlayEvent.System.DockSideChanged(OverlayDockSide.RIGHT))
+        overlayStore.dispatch(OverlayEvent.System.PassthroughChanged(false))
+
         startForeground(
             NOTIFICATION_ID,
             createNotification(),
@@ -150,21 +197,25 @@ class FullScreenOverlayService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> {
-                question = intent.getStringExtra(EXTRA_QUESTION)
-                targetPackage = intent.getStringExtra(EXTRA_PACKAGE_NAME) ?: DEFAULT_TARGET_PACKAGE
-                targetActivity = intent.getStringExtra(EXTRA_ACTIVITY_NAME)
-                touchPassthrough = false
-                ensureOverlay()
+            OverlayContract.ACTION_START -> {
+                val request =
+                    TargetLaunchRequest(
+                        question = intent.getStringExtra(OverlayContract.EXTRA_QUESTION),
+                        targetPackage =
+                            intent.getStringExtra(OverlayContract.EXTRA_TARGET_PACKAGE)
+                                ?: OverlayContract.DEFAULT_TARGET_PACKAGE,
+                        targetActivity = intent.getStringExtra(OverlayContract.EXTRA_TARGET_ACTIVITY),
+                    )
+                startOverlayUseCase(request)
             }
 
-            ACTION_SET_TOUCH_PASSTHROUGH -> {
-                val enabled = intent.getBooleanExtra(EXTRA_TOUCH_PASSTHROUGH, false)
-                setTouchPassthroughInternal(enabled)
+            OverlayContract.ACTION_SET_TOUCH_PASSTHROUGH -> {
+                val enabled = intent.getBooleanExtra(OverlayContract.EXTRA_TOUCH_PASSTHROUGH, false)
+                setTouchPassthroughUseCase(enabled)
             }
 
-            ACTION_TOGGLE_SIZE -> toggleWindowSize()
-            ACTION_STOP -> stopVirtualDisplayAndService()
+            OverlayContract.ACTION_TOGGLE_SIZE -> toggleOverlaySizeUseCase()
+            OverlayContract.ACTION_STOP -> stopOverlayUseCase()
         }
         return START_STICKY
     }
@@ -172,8 +223,7 @@ class FullScreenOverlayService : Service() {
     override fun onDestroy() {
         super.onDestroy()
 
-        activeAnimator?.cancel()
-        activeAnimator = null
+        overlayAnimator.cancel()
 
         removeViewImmediateSafely(miniTouchLayer)
         removeViewImmediateSafely(contentLayer)
@@ -195,9 +245,38 @@ class FullScreenOverlayService : Service() {
 
         virtualDisplay?.release()
         virtualDisplay = null
+        overlayStore.dispatch(OverlayEvent.System.VirtualDisplayReady(false))
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun executeOverlayEffect(effect: OverlayEffect) {
+        when (effect) {
+            is OverlayEffect.EnsureOverlay -> {
+                question = effect.request.question
+                targetPackage = effect.request.targetPackage
+                targetActivity = effect.request.targetActivity
+                touchPassthrough = false
+                ensureOverlay()
+            }
+
+            is OverlayEffect.ApplyTouchPassthrough -> {
+                setTouchPassthroughInternal(effect.enabled)
+            }
+
+            OverlayEffect.ToggleOverlaySize -> {
+                toggleWindowSize()
+            }
+
+            OverlayEffect.StopOverlay -> {
+                stopVirtualDisplayAndService()
+            }
+
+            is OverlayEffect.Trace -> {
+                traceLogger.logEffect(effect.message)
+            }
+        }
+    }
 
     @SuppressLint("ClickableViewAccessibility")
     private fun ensureOverlay() {
@@ -209,7 +288,7 @@ class FullScreenOverlayService : Service() {
         calculateGeometry()
         val trustedOverlay = hasInternalSystemWindowPermission()
 
-        backgroundParams = OverlayEffect.buildBackgroundLayoutParams(
+        backgroundParams = OverlayWindowParamsFactory.buildBackgroundLayoutParams(
             touchable = true,
             trustedOverlay = trustedOverlay
         )
@@ -221,7 +300,7 @@ class FullScreenOverlayService : Service() {
             }
         }
 
-        contentParams = OverlayEffect.buildContentLayoutParams(
+        contentParams = OverlayWindowParamsFactory.buildContentLayoutParams(
             touchable = true,
             trustedOverlay = trustedOverlay,
             width = largeWindowWidth,
@@ -273,6 +352,8 @@ class FullScreenOverlayService : Service() {
                 }
 
                 override fun onSurfaceTextureDestroyed(surfaceTexture: android.graphics.SurfaceTexture): Boolean {
+                    overlayStore.dispatch(OverlayEvent.System.SurfaceDestroyed)
+                    overlayStore.dispatch(OverlayEvent.System.VirtualDisplayReady(false))
                     return true
                 }
 
@@ -313,7 +394,7 @@ class FullScreenOverlayService : Service() {
             }
         )
 
-        miniTouchParams = OverlayEffect.buildMiniTouchLayoutParams(
+        miniTouchParams = OverlayWindowParamsFactory.buildMiniTouchLayoutParams(
             width = miniSize,
             height = miniHeight,
             trustedOverlay = trustedOverlay
@@ -357,14 +438,14 @@ class FullScreenOverlayService : Service() {
 
         updateMiniHandlePosition()
 
-        try {
-            windowManager.addView(backgroundLayer, backgroundParams)
-            windowManager.addView(contentLayer, contentParams)
-            windowManager.addView(miniTouchLayer, miniTouchParams)
-        } catch (e: Exception) {
-            Log.e(tag, "Failed to add overlay views", e)
+        if (
+            !windowHost.add(backgroundLayer, backgroundParams) ||
+            !windowHost.add(contentLayer, contentParams) ||
+            !windowHost.add(miniTouchLayer, miniTouchParams)
+        ) {
             return
         }
+        overlayStore.dispatch(OverlayEvent.System.WindowAttached)
 
         applyLargeVisualState(immediate = true)
         launchTargetOnDisplay()
@@ -375,33 +456,34 @@ class FullScreenOverlayService : Service() {
         val bounds = metrics.bounds
         val systemBarInsets = metrics.windowInsets.getInsetsIgnoringVisibility(WindowInsets.Type.systemBars())
 
-        screenWidth = bounds.width()
-        screenHeight = bounds.height()
-        topInset = systemBarInsets.top
-        bottomInset = systemBarInsets.bottom
+        val geometry =
+            geometryCalculator.calculate(
+                screenWidth = bounds.width(),
+                screenHeight = bounds.height(),
+                topInset = systemBarInsets.top,
+                bottomInset = systemBarInsets.bottom,
+                dpToPx = ::dpToPx,
+                virtualAspect = VIRTUAL_ASPECT,
+                largeWidthRatio = LARGE_WIDTH_RATIO,
+                maxLargeHeightRatio = MAX_LARGE_HEIGHT_RATIO,
+                miniWidthRatio = MINI_WIDTH_RATIO,
+                miniMinSizeDp = MINI_MIN_SIZE_DP,
+                miniCornerRadiusDp = MINI_CORNER_RADIUS_DP,
+            )
 
-        var computedLargeWidth = (screenWidth * LARGE_WIDTH_RATIO).roundToInt()
-        var computedLargeHeight = (computedLargeWidth / VIRTUAL_ASPECT).roundToInt()
-
-        val maxLargeHeight = (screenHeight * MAX_LARGE_HEIGHT_RATIO).roundToInt()
-        if (computedLargeHeight > maxLargeHeight) {
-            computedLargeHeight = maxLargeHeight
-            computedLargeWidth = (computedLargeHeight * VIRTUAL_ASPECT).roundToInt()
-        }
-
-        largeWindowWidth = computedLargeWidth.coerceAtLeast(1)
-        largeWindowHeight = computedLargeHeight.coerceAtLeast(1)
-
-        largeWindowX = ((screenWidth - largeWindowWidth) / 2).coerceAtLeast(0)
-        largeWindowY = ((screenHeight - largeWindowHeight) / 2).coerceAtLeast(topInset)
-
-        val minMiniPx = dpToPx(MINI_MIN_SIZE_DP)
-        miniSize = max((screenWidth * MINI_WIDTH_RATIO).roundToInt(), minMiniPx)
-        miniScale = miniSize.toFloat() / largeWindowWidth.toFloat()
-        miniHeight = (largeWindowHeight * miniScale).roundToInt().coerceAtLeast(1)
-
-        miniClipRect = Rect(0, 0, largeWindowWidth, largeWindowHeight)
-        miniCornerRadiusPx = dpToPx(MINI_CORNER_RADIUS_DP)
+        screenWidth = geometry.screenWidth
+        screenHeight = geometry.screenHeight
+        topInset = geometry.topInset
+        bottomInset = geometry.bottomInset
+        largeWindowWidth = geometry.largeWindowWidth
+        largeWindowHeight = geometry.largeWindowHeight
+        largeWindowX = geometry.largeWindowX
+        largeWindowY = geometry.largeWindowY
+        miniSize = geometry.miniSize
+        miniHeight = geometry.miniHeight
+        miniScale = geometry.miniScale
+        miniClipRect = Rect(geometry.miniClipRect)
+        miniCornerRadiusPx = geometry.miniCornerRadiusPx
     }
 
     private fun attachVirtualDisplay(surface: Surface, width: Int, height: Int) {
@@ -417,45 +499,28 @@ class FullScreenOverlayService : Service() {
                 surface,
                 flags
             )
+            overlayStore.dispatch(OverlayEvent.System.VirtualDisplayReady(true))
             launchTargetOnDisplay()
         } else {
             virtualDisplay?.surface = surface
+            overlayStore.dispatch(OverlayEvent.System.VirtualDisplayReady(true))
         }
     }
 
     private fun launchTargetOnDisplay() {
         val display = virtualDisplay?.display ?: return
-        val options = android.app.ActivityOptions.makeBasic().setLaunchDisplayId(display.displayId)
-        val candidates = if (targetPackage == DEFAULT_TARGET_PACKAGE) {
-            listOfNotNull(resolveDialerImplicit(), resolveDialerFallback())
-        } else {
-            listOfNotNull(
-                resolveExplicitIntent(),
-                resolveLaunchIntent(),
-                resolveDialerFallback(),
-                resolveDialerImplicit()
+        val request =
+            TargetLaunchRequest(
+                question = question,
+                targetPackage = targetPackage,
+                targetActivity = targetActivity,
             )
-        }
-
-        if (candidates.isEmpty()) {
-            Log.w(tag, "Launch intent not found for $targetPackage")
-            return
-        }
-
-        for (candidate in candidates) {
-            question?.let { candidate.putExtra(EXTRA_QUESTION, it) }
-            candidate.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            try {
-                startActivity(candidate, options.toBundle())
-                return
-            } catch (e: Exception) {
-                Log.e(tag, "Failed to start target activity with $candidate", e)
-            }
-        }
+        val candidates = targetIntentResolver.resolveCandidates(request)
+        targetLauncher.launchOnDisplay(display.displayId, request, candidates)
     }
 
     private fun stopVirtualDisplayAndService() {
-        if (targetPackage != DEFAULT_TARGET_PACKAGE) {
+        if (targetPackage != OverlayContract.DEFAULT_TARGET_PACKAGE) {
             try {
                 Log.d(tag, "Force stopping package: $targetPackage")
                 val method = activityManager.javaClass.getMethod("forceStopPackage", String::class.java)
@@ -469,66 +534,43 @@ class FullScreenOverlayService : Service() {
         Handler(Looper.getMainLooper()).postDelayed({ stopSelf() }, 500)
     }
 
-    private fun resolveLaunchIntent(): Intent? {
-        Log.d(tag, "resolveLaunchIntent: targetPackage=$targetPackage")
-
-        try {
-            packageManager.getPackageInfo(targetPackage, 0)
-            Log.d(tag, "Package $targetPackage exists")
-        } catch (e: Exception) {
-            Log.w(tag, "Package $targetPackage not found", e)
-            return null
-        }
-
-        val launchIntent = packageManager.getLaunchIntentForPackage(targetPackage)
-        if (launchIntent != null) {
-            Log.d(tag, "Found launch intent: ${launchIntent.component}")
-            return launchIntent
-        }
-
-        val queryIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        val resolveInfos = packageManager.queryIntentActivities(queryIntent, 0)
-        val match = resolveInfos.firstOrNull { it.activityInfo.packageName == targetPackage } ?: return null
-
-        return Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).apply {
-            component = ComponentName(targetPackage, match.activityInfo.name)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-    }
-
-    private fun resolveExplicitIntent(): Intent? {
-        val activityName = targetActivity?.takeIf { it.isNotBlank() } ?: return null
-        val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER).apply {
-            component = ComponentName(targetPackage, activityName)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        return intent.takeIf { it.resolveActivity(packageManager) != null }
-    }
-
-    private fun resolveDialerFallback(): Intent? {
-        val dialIntent = Intent(Intent.ACTION_DIAL).apply {
-            data = "tel:".toUri()
-            setPackage(targetPackage)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        val resolved = dialIntent.resolveActivity(packageManager) ?: return null
-        return dialIntent.setComponent(resolved)
-    }
-
-    private fun resolveDialerImplicit(): Intent? {
-        val dialIntent = Intent(Intent.ACTION_DIAL).apply {
-            data = "tel:".toUri()
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        return dialIntent.takeIf { it.resolveActivity(packageManager) != null }
-    }
-
     private fun setTouchPassthroughInternal(enabled: Boolean) {
         touchPassthrough = enabled
+        overlayStore.dispatch(OverlayEvent.System.PassthroughChanged(enabled))
+    }
+
+    private fun updateWindowMode(next: WindowMode) {
+        if (windowMode == next) {
+            return
+        }
+        windowMode = next
+        overlayStore.dispatch(
+            OverlayEvent.System.ModeChanged(
+                mode = next.toCoreMode(),
+            ),
+        )
+    }
+
+    private fun updateDockSide(next: DockSide) {
+        if (dockSide == next) {
+            return
+        }
+        dockSide = next
+        overlayStore.dispatch(
+            OverlayEvent.System.DockSideChanged(
+                dockSide = next.toCoreDockSide(),
+            ),
+        )
     }
 
     private fun handleBackgroundTouch(event: MotionEvent) {
-        if (overlayState != OverlayState.LARGE || isAnimating) {
+        overlayStore.dispatch(
+            gestureInterpreter.asMotion(
+                source = OverlayEvent.Touch.Source.BACKGROUND,
+                event = event,
+            ),
+        )
+        if (windowMode != WindowMode.LARGE || isAnimating) {
             return
         }
 
@@ -555,7 +597,13 @@ class FullScreenOverlayService : Service() {
     }
 
     private fun handleContentTouch(event: MotionEvent) {
-        if (overlayState != OverlayState.LARGE || isAnimating) {
+        overlayStore.dispatch(
+            gestureInterpreter.asMotion(
+                source = OverlayEvent.Touch.Source.CONTENT,
+                event = event,
+            ),
+        )
+        if (windowMode != WindowMode.LARGE || isAnimating) {
             return
         }
 
@@ -567,52 +615,45 @@ class FullScreenOverlayService : Service() {
     private fun injectTouchToVirtualDisplay(event: MotionEvent) {
         val display = virtualDisplay?.display ?: return
 
-        val x = event.x.coerceIn(0f, largeWindowWidth.toFloat())
-        val y = event.y.coerceIn(0f, largeWindowHeight.toFloat())
-
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 touchDownTime = SystemClock.uptimeMillis()
-                InputInjector.injectMotionEvent(
-                    inputManager,
-                    display.displayId,
-                    MotionEvent.ACTION_DOWN,
-                    x,
-                    y,
-                    touchDownTime
+                displayTouchInjector.inject(
+                    displayId = display.displayId,
+                    event = event,
+                    maxWidth = largeWindowWidth,
+                    maxHeight = largeWindowHeight,
+                    downTime = touchDownTime,
                 )
             }
 
             MotionEvent.ACTION_MOVE -> {
-                InputInjector.injectMotionEvent(
-                    inputManager,
-                    display.displayId,
-                    MotionEvent.ACTION_MOVE,
-                    x,
-                    y,
-                    touchDownTime
+                displayTouchInjector.inject(
+                    displayId = display.displayId,
+                    event = event,
+                    maxWidth = largeWindowWidth,
+                    maxHeight = largeWindowHeight,
+                    downTime = touchDownTime,
                 )
             }
 
             MotionEvent.ACTION_UP -> {
-                InputInjector.injectMotionEvent(
-                    inputManager,
-                    display.displayId,
-                    MotionEvent.ACTION_UP,
-                    x,
-                    y,
-                    touchDownTime
+                displayTouchInjector.inject(
+                    displayId = display.displayId,
+                    event = event,
+                    maxWidth = largeWindowWidth,
+                    maxHeight = largeWindowHeight,
+                    downTime = touchDownTime,
                 )
             }
 
             MotionEvent.ACTION_CANCEL -> {
-                InputInjector.injectMotionEvent(
-                    inputManager,
-                    display.displayId,
-                    MotionEvent.ACTION_CANCEL,
-                    x,
-                    y,
-                    touchDownTime
+                displayTouchInjector.inject(
+                    displayId = display.displayId,
+                    event = event,
+                    maxWidth = largeWindowWidth,
+                    maxHeight = largeWindowHeight,
+                    downTime = touchDownTime,
                 )
             }
         }
@@ -651,6 +692,11 @@ class FullScreenOverlayService : Service() {
                 dragDistance = (dragStartY - event.rawY).coerceAtLeast(0f)
                 if (!isHandleDragDetected && dragDistance > TOUCH_SLOP_PX) {
                     isHandleDragDetected = true
+                    overlayStore.dispatch(
+                        OverlayEvent.System.TouchSubStateChanged(
+                            subState = OverlayTouchSubState.HANDLE_DRAGGING,
+                        ),
+                    )
                 }
                 if (isHandleDragDetected) {
                     previewDragDistance = if (previewDragDistance == 0f) {
@@ -673,6 +719,11 @@ class FullScreenOverlayService : Service() {
                 isHandleDragDetected = false
                 dragDistance = 0f
                 previewDragDistance = 0f
+                overlayStore.dispatch(
+                    OverlayEvent.System.TouchSubStateChanged(
+                        subState = OverlayTouchSubState.IDLE,
+                    ),
+                )
             }
         }
     }
@@ -701,10 +752,28 @@ class FullScreenOverlayService : Service() {
     }
 
     private fun handleMiniTouch(event: MotionEvent) {
-        when (overlayState) {
-            OverlayState.MINI -> handleMiniWindowTouch(event)
-            OverlayState.MINI_MASKED -> handleMaskedMiniTouch(event)
-            OverlayState.LARGE -> Unit
+        when (windowMode) {
+            WindowMode.MINI -> {
+                overlayStore.dispatch(
+                    gestureInterpreter.asMotion(
+                        source = OverlayEvent.Touch.Source.MINI,
+                        event = event,
+                    ),
+                )
+                handleMiniWindowTouch(event)
+            }
+
+            WindowMode.MINI_MASKED -> {
+                overlayStore.dispatch(
+                    gestureInterpreter.asMotion(
+                        source = OverlayEvent.Touch.Source.MASKED_MINI,
+                        event = event,
+                    ),
+                )
+                handleMaskedMiniTouch(event)
+            }
+
+            WindowMode.LARGE -> Unit
         }
     }
 
@@ -724,6 +793,11 @@ class FullScreenOverlayService : Service() {
                 val deltaY = event.rawY - miniDownRawY
                 if (!isMiniDragging && (abs(deltaX) > TOUCH_SLOP_PX || abs(deltaY) > TOUCH_SLOP_PX)) {
                     isMiniDragging = true
+                    overlayStore.dispatch(
+                        OverlayEvent.System.TouchSubStateChanged(
+                            subState = OverlayTouchSubState.MINI_DRAGGING,
+                        ),
+                    )
                 }
                 if (!isMiniDragging) {
                     return
@@ -749,21 +823,26 @@ class FullScreenOverlayService : Service() {
                 val maskThreshold = miniMaskTriggerDistance()
                 when {
                     currentX <= -maskThreshold -> {
-                        dockSide = DockSide.LEFT
+                        updateDockSide(DockSide.LEFT)
                         animateMiniToMasked(currentY)
                     }
 
                     currentX >= (screenWidth - miniSize + maskThreshold) -> {
-                        dockSide = DockSide.RIGHT
+                        updateDockSide(DockSide.RIGHT)
                         animateMiniToMasked(currentY)
                     }
 
                     else -> {
-                        dockSide = resolveDockSide(currentX)
+                        updateDockSide(resolveDockSide(currentX))
                         val snapX = if (dockSide == DockSide.LEFT) 0 else screenWidth - miniSize
                         animateMiniToDocked(snapX, currentY)
                     }
                 }
+                overlayStore.dispatch(
+                    OverlayEvent.System.TouchSubStateChanged(
+                        subState = OverlayTouchSubState.IDLE,
+                    ),
+                )
             }
         }
     }
@@ -781,6 +860,11 @@ class FullScreenOverlayService : Service() {
                 val deltaY = event.rawY - miniDownRawY
                 if (!isMiniDragging && (abs(deltaX) > TOUCH_SLOP_PX || abs(deltaY) > TOUCH_SLOP_PX)) {
                     isMiniDragging = true
+                    overlayStore.dispatch(
+                        OverlayEvent.System.TouchSubStateChanged(
+                            subState = OverlayTouchSubState.MASKED_MINI_DRAGGING,
+                        ),
+                    )
                 }
                 if (!isMiniDragging) {
                     return
@@ -817,6 +901,11 @@ class FullScreenOverlayService : Service() {
                     val currentY = clampMiniY(miniTouchParams?.y ?: 0)
                     animateMaskedStay(currentY)
                 }
+                overlayStore.dispatch(
+                    OverlayEvent.System.TouchSubStateChanged(
+                        subState = OverlayTouchSubState.IDLE,
+                    ),
+                )
             }
         }
     }
@@ -830,15 +919,15 @@ class FullScreenOverlayService : Service() {
         if (!hasMiniPosition) {
             val firstX = screenWidth - miniSize
             val firstY = clampMiniY((screenHeight * FIRST_MINI_Y_RATIO).roundToInt())
-            dockSide = DockSide.RIGHT
+            updateDockSide(DockSide.RIGHT)
             return firstX to firstY
         }
 
         val x = if (lastMiniVisibleX <= 0) {
-            dockSide = DockSide.LEFT
+            updateDockSide(DockSide.LEFT)
             0
         } else {
-            dockSide = DockSide.RIGHT
+            updateDockSide(DockSide.RIGHT)
             screenWidth - miniSize
         }
         return x to clampMiniY(lastMiniVisibleY)
@@ -849,7 +938,7 @@ class FullScreenOverlayService : Service() {
         lastMiniVisibleX = snappedX
         lastMiniVisibleY = clampMiniY(y)
         hasMiniPosition = true
-        dockSide = if (snappedX == 0) DockSide.LEFT else DockSide.RIGHT
+        updateDockSide(if (snappedX == 0) DockSide.LEFT else DockSide.RIGHT)
     }
 
     private fun animateLargeToMini(targetX: Int, targetY: Int) {
@@ -869,7 +958,7 @@ class FullScreenOverlayService : Service() {
                 clearMaskedVisuals()
             },
             onEnd = {
-                overlayState = OverlayState.MINI
+                updateWindowMode(WindowMode.MINI)
                 rememberMiniVisiblePosition(targetX, clampedY)
                 applyMiniFrame(targetX, clampedY)
                 setMiniVisualState(masked = false)
@@ -891,7 +980,7 @@ class FullScreenOverlayService : Service() {
                 setBackgroundTouchable(true)
             },
             onEnd = {
-                overlayState = OverlayState.LARGE
+                updateWindowMode(WindowMode.LARGE)
                 applyLargeVisualState(immediate = false)
             }
         )
@@ -912,7 +1001,7 @@ class FullScreenOverlayService : Service() {
                 clearMaskedVisuals()
             },
             onEnd = {
-                overlayState = OverlayState.LARGE
+                updateWindowMode(WindowMode.LARGE)
                 applyLargeVisualState(immediate = false)
             }
         )
@@ -925,12 +1014,12 @@ class FullScreenOverlayService : Service() {
             targetY = clampedY,
             durationMs = SNAP_DURATION,
             onStart = {
-                overlayState = OverlayState.MINI
+                updateWindowMode(WindowMode.MINI)
                 setMiniVisualState(masked = false)
             },
             onEnd = {
                 rememberMiniVisiblePosition(targetX, clampedY)
-                overlayState = OverlayState.MINI
+                updateWindowMode(WindowMode.MINI)
                 setMiniVisualState(masked = false)
             }
         )
@@ -952,11 +1041,11 @@ class FullScreenOverlayService : Service() {
             targetY = clampedY,
             durationMs = MASK_DURATION,
             onStart = {
-                overlayState = OverlayState.MINI
+                updateWindowMode(WindowMode.MINI)
                 setMiniVisualState(masked = false)
             },
             onEnd = {
-                overlayState = OverlayState.MINI_MASKED
+                updateWindowMode(WindowMode.MINI_MASKED)
                 setMiniVisualState(masked = true)
             }
         )
@@ -971,11 +1060,11 @@ class FullScreenOverlayService : Service() {
             targetY = targetY,
             durationMs = MASK_DURATION,
             onStart = {
-                overlayState = OverlayState.MINI
+                updateWindowMode(WindowMode.MINI)
                 setMiniVisualState(masked = false)
             },
             onEnd = {
-                overlayState = OverlayState.MINI
+                updateWindowMode(WindowMode.MINI)
                 rememberMiniVisiblePosition(targetX, targetY)
                 setMiniVisualState(masked = false)
             }
@@ -995,11 +1084,11 @@ class FullScreenOverlayService : Service() {
             targetY = clampedY,
             durationMs = SNAP_DURATION,
             onStart = {
-                overlayState = OverlayState.MINI_MASKED
+                updateWindowMode(WindowMode.MINI_MASKED)
                 setMiniVisualState(masked = true)
             },
             onEnd = {
-                overlayState = OverlayState.MINI_MASKED
+                updateWindowMode(WindowMode.MINI_MASKED)
                 setMiniVisualState(masked = true)
             }
         )
@@ -1092,41 +1181,32 @@ class FullScreenOverlayService : Service() {
         onFrame: (Float) -> Unit,
         onEnd: () -> Unit
     ) {
-        activeAnimator?.cancel()
-
-        val animator = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = durationMs
-            interpolator = DecelerateInterpolator()
-            addUpdateListener { valueAnimator ->
-                onFrame(valueAnimator.animatedValue as Float)
-            }
-            addListener(object : Animator.AnimatorListener {
-                override fun onAnimationStart(animation: Animator) {
-                    isAnimating = true
-                    onStart()
-                }
-
-                override fun onAnimationEnd(animation: Animator) {
-                    isAnimating = false
-                    activeAnimator = null
-                    onEnd()
-                }
-
-                override fun onAnimationCancel(animation: Animator) {
-                    isAnimating = false
-                    activeAnimator = null
-                }
-
-                override fun onAnimationRepeat(animation: Animator) = Unit
-            })
-        }
-
-        activeAnimator = animator
-        animator.start()
+        overlayAnimator.start(
+            durationMs = durationMs,
+            onStart = {
+                isAnimating = true
+                overlayStore.dispatch(
+                    OverlayEvent.System.ActiveTransitionChanged(
+                        transition = "duration_${durationMs}",
+                    ),
+                )
+                onStart()
+            },
+            onFrame = onFrame,
+            onEnd = {
+                isAnimating = false
+                overlayStore.dispatch(OverlayEvent.System.ActiveTransitionChanged(transition = null))
+                onEnd()
+            },
+            onCancel = {
+                isAnimating = false
+                overlayStore.dispatch(OverlayEvent.System.ActiveTransitionChanged(transition = null))
+            },
+        )
     }
 
     private fun applyLargeVisualState(immediate: Boolean) {
-        overlayState = OverlayState.LARGE
+        updateWindowMode(WindowMode.LARGE)
 
         backgroundLayer?.visibility = View.VISIBLE
         clearMaskedVisuals()
@@ -1284,47 +1364,15 @@ class FullScreenOverlayService : Service() {
         params: WindowManager.LayoutParams?,
         touchable: Boolean
     ) {
-        if (view == null || params == null) {
-            return
-        }
-
-        val currentlyTouchable = params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE == 0
-        if (currentlyTouchable == touchable) {
-            return
-        }
-
-        params.flags = if (touchable) {
-            params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-        } else {
-            params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-        }
-        updateViewLayoutSafely(view, params)
+        windowHost.setTouchable(view, params, touchable)
     }
 
     private fun updateViewLayoutSafely(view: View?, params: WindowManager.LayoutParams?) {
-        if (view == null || params == null) {
-            return
-        }
-        try {
-            if (view.windowToken != null) {
-                windowManager.updateViewLayout(view, params)
-            }
-        } catch (e: Exception) {
-            Log.w(tag, "Failed to update view layout", e)
-        }
+        windowHost.update(view, params)
     }
 
     private fun removeViewImmediateSafely(view: View?) {
-        if (view == null) {
-            return
-        }
-        try {
-            if (view.windowToken != null) {
-                windowManager.removeViewImmediate(view)
-            }
-        } catch (e: Exception) {
-            Log.w(tag, "Failed to remove overlay view", e)
-        }
+        windowHost.remove(view)
     }
 
     private fun toggleWindowSize() {
@@ -1332,13 +1380,13 @@ class FullScreenOverlayService : Service() {
             return
         }
 
-        when (overlayState) {
-            OverlayState.LARGE -> {
+        when (windowMode) {
+            WindowMode.LARGE -> {
                 val target = resolveMiniTargetPosition()
                 animateLargeToMini(target.first, target.second)
             }
 
-            OverlayState.MINI, OverlayState.MINI_MASKED -> animateMiniToLarge()
+            WindowMode.MINI, WindowMode.MINI_MASKED -> animateMiniToLarge()
         }
     }
 
@@ -1400,7 +1448,7 @@ class FullScreenOverlayService : Service() {
         )
     }
 
-    private enum class OverlayState {
+    private enum class WindowMode {
         LARGE,
         MINI,
         MINI_MASKED
@@ -1411,20 +1459,22 @@ class FullScreenOverlayService : Service() {
         RIGHT
     }
 
+    private fun WindowMode.toCoreMode(): OverlayMode {
+        return when (this) {
+            WindowMode.LARGE -> OverlayMode.LARGE
+            WindowMode.MINI -> OverlayMode.MINI
+            WindowMode.MINI_MASKED -> OverlayMode.MINI_MASKED
+        }
+    }
+
+    private fun DockSide.toCoreDockSide(): OverlayDockSide {
+        return when (this) {
+            DockSide.LEFT -> OverlayDockSide.LEFT
+            DockSide.RIGHT -> OverlayDockSide.RIGHT
+        }
+    }
+
     companion object {
-        // 启动悬浮窗服务的动作常量
-        private const val ACTION_START = "org.avium.autotask.action.START_OVERLAY"
-        // 设置触摸穿透的动作常量
-        private const val ACTION_SET_TOUCH_PASSTHROUGH = "org.avium.autotask.action.SET_TOUCH_PASSTHROUGH"
-        // 切换窗口大小的动作常量
-        private const val ACTION_TOGGLE_SIZE = "org.avium.autotask.action.TOGGLE_SIZE"
-        // 停止悬浮窗服务的动作常量
-        private const val ACTION_STOP = "org.avium.autotask.action.STOP_OVERLAY"
-
-        // 默认目标应用包名（拨号器）
-        private const val DEFAULT_TARGET_PACKAGE = "com.android.dialer"
-
-        // 通知ID和频道ID
         private const val NOTIFICATION_ID = 1001
         private const val NOTIFICATION_CHANNEL_ID = "autotask_overlay"
         private const val PERMISSION_INTERNAL_SYSTEM_WINDOW = "android.permission.INTERNAL_SYSTEM_WINDOW"
@@ -1486,30 +1536,5 @@ class FullScreenOverlayService : Service() {
 
         // 遮罩模糊半径（像素）
         private const val BLUR_RADIUS_PX = 16f
-
-        fun start(context: Context, question: String?, packageName: String?, activityName: String? = null) {
-            val intent = Intent(context, FullScreenOverlayService::class.java).apply {
-                action = ACTION_START
-                putExtra(EXTRA_QUESTION, question)
-                putExtra(EXTRA_PACKAGE_NAME, packageName ?: DEFAULT_TARGET_PACKAGE)
-                putExtra(EXTRA_ACTIVITY_NAME, activityName)
-            }
-            context.startForegroundService(intent)
-        }
-
-        fun setTouchPassthrough(context: Context, enabled: Boolean) {
-            val intent = Intent(context, FullScreenOverlayService::class.java).apply {
-                action = ACTION_SET_TOUCH_PASSTHROUGH
-                putExtra(EXTRA_TOUCH_PASSTHROUGH, enabled)
-            }
-            context.startForegroundService(intent)
-        }
-
-        fun stop(context: Context) {
-            val intent = Intent(context, FullScreenOverlayService::class.java).apply {
-                action = ACTION_STOP
-            }
-            context.startService(intent)
-        }
     }
 }

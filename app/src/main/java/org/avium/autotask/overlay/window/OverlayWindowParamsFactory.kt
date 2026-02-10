@@ -1,10 +1,10 @@
-package org.avium.autotask
+package org.avium.autotask.overlay.window
 
 import android.graphics.PixelFormat
 import android.view.Gravity
 import android.view.WindowManager
 
-object OverlayEffect {
+object OverlayWindowParamsFactory {
     private const val BASE_FLAGS =
         WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
@@ -14,13 +14,13 @@ object OverlayEffect {
 
     fun buildBackgroundLayoutParams(
         touchable: Boolean,
-        trustedOverlay: Boolean
+        trustedOverlay: Boolean,
     ): WindowManager.LayoutParams {
         return createParams(
             touchable = touchable,
             type = resolveWindowType(trustedOverlay),
             width = WindowManager.LayoutParams.MATCH_PARENT,
-            height = WindowManager.LayoutParams.MATCH_PARENT
+            height = WindowManager.LayoutParams.MATCH_PARENT,
         )
     }
 
@@ -28,26 +28,26 @@ object OverlayEffect {
         touchable: Boolean,
         trustedOverlay: Boolean,
         width: Int,
-        height: Int
+        height: Int,
     ): WindowManager.LayoutParams {
         return createParams(
             touchable = touchable,
             type = resolveWindowType(trustedOverlay),
             width = width,
-            height = height
+            height = height,
         )
     }
 
     fun buildMiniTouchLayoutParams(
         width: Int,
         height: Int,
-        trustedOverlay: Boolean
+        trustedOverlay: Boolean,
     ): WindowManager.LayoutParams {
         return createParams(
             touchable = true,
             type = resolveWindowType(trustedOverlay),
             width = width,
-            height = height
+            height = height,
         )
     }
 
@@ -63,20 +63,21 @@ object OverlayEffect {
         touchable: Boolean,
         type: Int,
         width: Int,
-        height: Int
+        height: Int,
     ): WindowManager.LayoutParams {
-        val flags = if (touchable) {
-            BASE_FLAGS
-        } else {
-            BASE_FLAGS or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-        }
+        val flags =
+            if (touchable) {
+                BASE_FLAGS
+            } else {
+                BASE_FLAGS or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            }
 
         return WindowManager.LayoutParams(
             width,
             height,
             type,
             flags,
-            PixelFormat.RGBA_8888
+            PixelFormat.RGBA_8888,
         ).apply {
             gravity = Gravity.TOP or Gravity.START
             x = 0

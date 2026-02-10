@@ -1,4 +1,4 @@
-package org.avium.autotask.util
+package org.avium.autotask.overlay.input
 
 import android.annotation.SuppressLint
 import android.hardware.input.InputManager

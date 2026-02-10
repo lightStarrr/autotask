@@ -50,20 +50,20 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.AutoTask">
         <activity
-            android:name=".MainActivity"
+            android:name=".overlay.entry.OverlayEntryActivity"
             android:excludeFromRecents="true"
             android:exported="true"
             android:label="@string/app_name"
             android:theme="@style/Theme.AutoTask">
             <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
+                <action android:name="org.avium.autotask.overlay.action.START" />
 
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
 
         <service
-            android:name=".FullScreenOverlayService"
+            android:name=".overlay.service.OverlayService"
             android:foregroundServiceType="dataSync"
             android:exported="false" />
     </application>
