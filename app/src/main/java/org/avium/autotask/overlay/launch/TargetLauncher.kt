@@ -20,16 +20,20 @@ class TargetLauncher(
             return false
         }
 
-        val options = ActivityOptions.makeBasic().setLaunchDisplayId(displayId)
+        // Force no-transition launch on the virtual display so mini mode does not flash app-open animation.
+        val options =
+            ActivityOptions.makeCustomAnimation(context, 0, 0)
+                .setLaunchDisplayId(displayId)
 
         for (candidate in candidates) {
-            request.question?.let { candidate.putExtra(OverlayContract.EXTRA_QUESTION, it) }
-            candidate.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            val launchIntent = Intent(candidate)
+            request.question?.let { launchIntent.putExtra(OverlayContract.EXTRA_QUESTION, it) }
+            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
             try {
-                context.startActivity(candidate, options.toBundle())
+                context.startActivity(launchIntent, options.toBundle())
                 return true
             } catch (e: Exception) {
-                Log.e(loggerTag, "Failed to start target activity with $candidate", e)
+                Log.e(loggerTag, "Failed to start target activity with $launchIntent", e)
             }
         }
         return false
