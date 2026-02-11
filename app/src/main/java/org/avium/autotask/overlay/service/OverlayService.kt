@@ -13,6 +13,7 @@ import android.graphics.Outline
 import android.graphics.Rect
 import android.graphics.RenderEffect
 import android.graphics.Shader
+import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.hardware.input.InputManager
@@ -117,6 +118,7 @@ class OverlayService : Service() {
     private var largeWindowHeight = 0
     private var largeWindowX = 0
     private var largeWindowY = 0
+    private var largeCornerRadiusPx = 0
 
     private var miniSize = 0
     private var miniHeight = 0
@@ -150,7 +152,7 @@ class OverlayService : Service() {
     private val contentOutlineProvider = object : ViewOutlineProvider() {
         override fun getOutline(view: View, outline: Outline) {
             if (windowMode == WindowMode.LARGE) {
-                outline.setRect(0, 0, view.width, view.height)
+                outline.setRoundRect(0, 0, view.width, view.height, largeCornerRadiusPx.toFloat())
                 return
             }
             if (miniClipRect.isEmpty) {
@@ -414,7 +416,7 @@ class OverlayService : Service() {
         }
 
         miniMaskView = View(this).apply {
-            setBackgroundColor(0x33000000)
+            background = createMiniMaskDrawable()
             visibility = View.GONE
         }
 
@@ -479,6 +481,7 @@ class OverlayService : Service() {
         largeWindowHeight = geometry.largeWindowHeight
         largeWindowX = geometry.largeWindowX
         largeWindowY = geometry.largeWindowY
+        largeCornerRadiusPx = dpToPx(LARGE_CORNER_RADIUS_DP)
         miniSize = geometry.miniSize
         miniHeight = geometry.miniHeight
         miniScale = geometry.miniScale
@@ -1213,7 +1216,7 @@ class OverlayService : Service() {
         bottomHandleBar?.visibility = View.VISIBLE
 
         contentContainer?.setBackgroundColor(0xFF000000.toInt())
-        contentLayer?.clipToOutline = false
+        contentLayer?.clipToOutline = true
         contentLayer?.invalidateOutline()
 
         setBackgroundTouchable(true)
@@ -1264,6 +1267,14 @@ class OverlayService : Service() {
         contentLayer?.setRenderEffect(null)
         miniMaskView?.visibility = View.GONE
         miniHandleView?.visibility = View.GONE
+    }
+
+    private fun createMiniMaskDrawable(): GradientDrawable {
+        return GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            setColor(0x33000000)
+            cornerRadius = miniCornerRadiusPx.toFloat()
+        }
     }
 
     private fun updateMiniHandlePosition() {
@@ -1319,10 +1330,6 @@ class OverlayService : Service() {
         root.scaleX = scale
         root.scaleY = scale
         root.clipBounds = clip?.let { Rect(it) }
-
-        if (clip == null) {
-            root.clipToOutline = false
-        }
 
         if (bottomHandleBar?.visibility == View.VISIBLE) {
             updateBottomHandlePosition(x, y, scale)
@@ -1485,6 +1492,8 @@ class OverlayService : Service() {
         private const val LARGE_WIDTH_RATIO = 0.70f
         // 大窗口最大高度占屏幕的比例
         private const val MAX_LARGE_HEIGHT_RATIO = 0.80f
+        // 大窗口圆角半径（dp）
+        private const val LARGE_CORNER_RADIUS_DP = 24f
 
         // 小窗口宽度占屏幕的比例
         private const val MINI_WIDTH_RATIO = 0.10f
