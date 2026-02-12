@@ -2,10 +2,14 @@ package org.avium.autotask.overlay.service
 
 import android.annotation.SuppressLint
 import android.app.ActivityManager
+import android.app.IActivityManager
+import android.app.IActivityTaskManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.app.TaskStackListener
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -20,8 +24,10 @@ import android.hardware.input.InputManager
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.ServiceManager
 import android.os.SystemClock
 import android.util.Log
+import android.view.Display
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.Surface
@@ -75,6 +81,8 @@ class OverlayService : Service() {
     private lateinit var targetLauncher: TargetLauncher
     private lateinit var geometryCalculator: OverlayGeometryCalculator
     private lateinit var windowHost: OverlayWindowHost
+    private var hiddenActivityManager: IActivityManager? = null
+    private var hiddenActivityTaskManager: IActivityTaskManager? = null
 
     private lateinit var overlayStore: OverlayStore
     private lateinit var startOverlayUseCase: StartOverlayUseCase
@@ -148,6 +156,41 @@ class OverlayService : Service() {
     private var question: String? = null
     private var targetPackage: String = OverlayContract.DEFAULT_TARGET_PACKAGE
     private var targetActivity: String? = null
+    private val trackedTaskIds = mutableSetOf<Int>()
+
+    private val taskStackListener =
+        object : TaskStackListener() {
+            override fun onTaskCreated(taskId: Int, componentName: ComponentName?) {
+                if (componentName?.packageName == targetPackage) {
+                    trackedTaskIds.add(taskId)
+                    Log.d(tag, "Tracked task created: $taskId $componentName")
+                }
+            }
+
+            override fun onTaskRemoved(taskId: Int) {
+                trackedTaskIds.remove(taskId)
+            }
+
+            override fun onTaskRemovalStarted(taskInfo: ActivityManager.RunningTaskInfo) {
+                trackedTaskIds.remove(taskInfo.taskId)
+            }
+
+            override fun onTaskDisplayChanged(taskId: Int, newDisplayId: Int) {
+                val display = virtualDisplay?.display ?: return
+                if (newDisplayId == display.displayId) {
+                    trackedTaskIds.add(taskId)
+                    return
+                }
+
+                if (trackedTaskIds.contains(taskId) && newDisplayId == Display.DEFAULT_DISPLAY) {
+                    val moved = moveTaskBackToVirtualDisplay(taskId, display.displayId)
+                    if (!moved) {
+                        // Keep the same fallback strategy as Flyme: relaunch when task move fails.
+                        launchTargetOnDisplay()
+                    }
+                }
+            }
+        }
 
     private val contentOutlineProvider = object : ViewOutlineProvider() {
         override fun getOutline(view: View, outline: Outline) {
@@ -169,10 +212,12 @@ class OverlayService : Service() {
         displayManager = getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
         inputManager = getSystemService(Context.INPUT_SERVICE) as InputManager
         activityManager = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        initHiddenManagers()
+        registerTaskStackListenerIfPossible()
 
         displayTouchInjector = DisplayTouchInjector(inputManager)
         targetIntentResolver = TargetIntentResolver(packageManager, tag)
-        targetLauncher = TargetLauncher(this, tag)
+        targetLauncher = TargetLauncher(this, tag, hiddenActivityManager)
         geometryCalculator = OverlayGeometryCalculator()
         windowHost = OverlayWindowHost(windowManager, tag)
 
@@ -226,6 +271,8 @@ class OverlayService : Service() {
         super.onDestroy()
 
         overlayAnimator.cancel()
+        unregisterTaskStackListenerIfPossible()
+        trackedTaskIds.clear()
 
         removeViewImmediateSafely(miniTouchLayer)
         removeViewImmediateSafely(contentLayer)
@@ -519,7 +566,59 @@ class OverlayService : Service() {
                 targetActivity = targetActivity,
             )
         val candidates = targetIntentResolver.resolveCandidates(request)
-        targetLauncher.launchOnDisplay(display.displayId, request, candidates)
+        val launched = targetLauncher.launchOnDisplay(display.displayId, request, candidates)
+        if (!launched) {
+            Log.w(tag, "Target launch failed on display ${display.displayId}")
+        }
+    }
+
+    private fun initHiddenManagers() {
+        hiddenActivityManager =
+            runCatching {
+                IActivityManager.Stub.asInterface(ServiceManager.getService("activity"))
+            }.onFailure {
+                Log.e(tag, "Failed to init IActivityManager", it)
+            }.getOrNull()
+
+        hiddenActivityTaskManager =
+            runCatching {
+                IActivityTaskManager.Stub.asInterface(ServiceManager.getService("activity_task"))
+            }.onFailure {
+                Log.e(tag, "Failed to init IActivityTaskManager", it)
+            }.getOrNull()
+    }
+
+    private fun registerTaskStackListenerIfPossible() {
+        val atm = hiddenActivityTaskManager
+        if (atm == null) {
+            Log.w(tag, "IActivityTaskManager unavailable, task reroute protection disabled")
+            return
+        }
+        runCatching {
+            atm.registerTaskStackListener(taskStackListener)
+        }.onFailure {
+            Log.e(tag, "registerTaskStackListener failed", it)
+        }
+    }
+
+    private fun unregisterTaskStackListenerIfPossible() {
+        val atm = hiddenActivityTaskManager ?: return
+        runCatching {
+            atm.unregisterTaskStackListener(taskStackListener)
+        }.onFailure {
+            Log.e(tag, "unregisterTaskStackListener failed", it)
+        }
+    }
+
+    private fun moveTaskBackToVirtualDisplay(taskId: Int, displayId: Int): Boolean {
+        val atm = hiddenActivityTaskManager ?: return false
+        return runCatching {
+            atm.moveRootTaskToDisplay(taskId, displayId)
+            Log.d(tag, "Moved task $taskId back to display $displayId")
+            true
+        }.onFailure {
+            Log.e(tag, "moveRootTaskToDisplay failed for task=$taskId display=$displayId", it)
+        }.getOrDefault(false)
     }
 
     private fun stopVirtualDisplayAndService() {
