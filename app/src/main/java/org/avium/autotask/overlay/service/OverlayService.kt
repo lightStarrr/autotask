@@ -386,8 +386,8 @@ class OverlayService : Service() {
                     width: Int,
                     height: Int
                 ) {
-                    surfaceTexture.setDefaultBufferSize(width, height)
-                    attachVirtualDisplay(Surface(surfaceTexture), width, height)
+                    surfaceTexture.setDefaultBufferSize(FIXED_VIRTUAL_WIDTH, FIXED_VIRTUAL_HEIGHT)
+                    attachVirtualDisplay(Surface(surfaceTexture))
                     applyTextureTransformForState()
                 }
 
@@ -396,7 +396,12 @@ class OverlayService : Service() {
                     width: Int,
                     height: Int
                 ) {
-                    surfaceTexture.setDefaultBufferSize(width, height)
+                    surfaceTexture.setDefaultBufferSize(FIXED_VIRTUAL_WIDTH, FIXED_VIRTUAL_HEIGHT)
+                    virtualDisplay?.resize(
+                        FIXED_VIRTUAL_WIDTH,
+                        FIXED_VIRTUAL_HEIGHT,
+                        FIXED_VIRTUAL_DENSITY_DPI,
+                    )
                     applyTextureTransformForState()
                 }
 
@@ -536,22 +541,26 @@ class OverlayService : Service() {
         miniCornerRadiusPx = geometry.miniCornerRadiusPx
     }
 
-    private fun attachVirtualDisplay(surface: Surface, width: Int, height: Int) {
-        val densityDpi = resources.displayMetrics.densityDpi
+    private fun attachVirtualDisplay(surface: Surface) {
         if (virtualDisplay == null) {
             val flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
             virtualDisplay = displayManager.createVirtualDisplay(
-                "AutoTask@${SystemClock.uptimeMillis()}",
-                width,
-                height,
-                densityDpi,
+                "AutoTask",
+                FIXED_VIRTUAL_WIDTH,
+                FIXED_VIRTUAL_HEIGHT,
+                FIXED_VIRTUAL_DENSITY_DPI,
                 surface,
                 flags
             )
             overlayStore.dispatch(OverlayEvent.System.VirtualDisplayReady(true))
             launchTargetOnDisplay()
         } else {
+            virtualDisplay?.resize(
+                FIXED_VIRTUAL_WIDTH,
+                FIXED_VIRTUAL_HEIGHT,
+                FIXED_VIRTUAL_DENSITY_DPI,
+            )
             virtualDisplay?.surface = surface
             overlayStore.dispatch(OverlayEvent.System.VirtualDisplayReady(true))
         }
@@ -716,49 +725,45 @@ class OverlayService : Service() {
 
     private fun injectTouchToVirtualDisplay(event: MotionEvent) {
         val display = virtualDisplay?.display ?: return
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            touchDownTime = SystemClock.uptimeMillis()
+        }
+
+        val mappedX =
+            mapWindowTouchToVirtualAxis(
+                value = event.x,
+                sourceSize = largeWindowWidth,
+                targetSize = FIXED_VIRTUAL_WIDTH,
+            )
+        val mappedY =
+            mapWindowTouchToVirtualAxis(
+                value = event.y,
+                sourceSize = largeWindowHeight,
+                targetSize = FIXED_VIRTUAL_HEIGHT,
+            )
 
         when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                touchDownTime = SystemClock.uptimeMillis()
-                displayTouchInjector.inject(
-                    displayId = display.displayId,
-                    event = event,
-                    maxWidth = largeWindowWidth,
-                    maxHeight = largeWindowHeight,
-                    downTime = touchDownTime,
-                )
-            }
-
-            MotionEvent.ACTION_MOVE -> {
-                displayTouchInjector.inject(
-                    displayId = display.displayId,
-                    event = event,
-                    maxWidth = largeWindowWidth,
-                    maxHeight = largeWindowHeight,
-                    downTime = touchDownTime,
-                )
-            }
-
-            MotionEvent.ACTION_UP -> {
-                displayTouchInjector.inject(
-                    displayId = display.displayId,
-                    event = event,
-                    maxWidth = largeWindowWidth,
-                    maxHeight = largeWindowHeight,
-                    downTime = touchDownTime,
-                )
-            }
-
+            MotionEvent.ACTION_DOWN,
+            MotionEvent.ACTION_MOVE,
+            MotionEvent.ACTION_UP,
             MotionEvent.ACTION_CANCEL -> {
                 displayTouchInjector.inject(
                     displayId = display.displayId,
-                    event = event,
-                    maxWidth = largeWindowWidth,
-                    maxHeight = largeWindowHeight,
+                    action = event.actionMasked,
+                    x = mappedX,
+                    y = mappedY,
                     downTime = touchDownTime,
                 )
             }
         }
+    }
+
+    private fun mapWindowTouchToVirtualAxis(value: Float, sourceSize: Int, targetSize: Int): Float {
+        if (sourceSize <= 0 || targetSize <= 0) {
+            return 0f
+        }
+        return ((value / sourceSize.toFloat()) * targetSize)
+            .coerceIn(0f, targetSize.toFloat())
     }
 
     private fun isTouchOnBottomHandle(event: MotionEvent): Boolean {
@@ -1587,6 +1592,12 @@ class OverlayService : Service() {
 
         // 虚拟显示的宽高比（9:16）
         private const val VIRTUAL_ASPECT = 9f / 16f
+        // 固定虚拟显示宽度（像素）
+        private const val FIXED_VIRTUAL_WIDTH = 1080
+        // 固定虚拟显示高度（像素）
+        private const val FIXED_VIRTUAL_HEIGHT = 1920
+        // 固定虚拟显示密度（dpi）
+        private const val FIXED_VIRTUAL_DENSITY_DPI = 420
         // 大窗口宽度占屏幕的比例
         private const val LARGE_WIDTH_RATIO = 0.70f
         // 大窗口最大高度占屏幕的比例
