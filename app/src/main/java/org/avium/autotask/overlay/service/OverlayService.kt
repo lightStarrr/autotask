@@ -133,6 +133,7 @@ class OverlayService : Service() {
     private var miniScale = 1f
     private var miniClipRect: Rect = Rect()
     private var miniCornerRadiusPx = 0
+    private var miniDockEdgeInsetPx = 0
 
     private var hasMiniPosition = false
     private var lastMiniVisibleX = 0
@@ -539,6 +540,7 @@ class OverlayService : Service() {
         miniScale = geometry.miniScale
         miniClipRect = Rect(geometry.miniClipRect)
         miniCornerRadiusPx = geometry.miniCornerRadiusPx
+        miniDockEdgeInsetPx = dpToPx(MINI_DOCK_EDGE_INSET_DP)
     }
 
     private fun attachVirtualDisplay(surface: Surface) {
@@ -929,19 +931,19 @@ class OverlayService : Service() {
                 val currentY = clampMiniY(params.y)
                 val maskThreshold = miniMaskTriggerDistance()
                 when {
-                    currentX <= -maskThreshold -> {
+                    currentX <= (leftMiniDockX() - maskThreshold) -> {
                         updateDockSide(DockSide.LEFT)
                         animateMiniToMasked(currentY)
                     }
 
-                    currentX >= (screenWidth - miniSize + maskThreshold) -> {
+                    currentX >= (rightMiniDockX() + maskThreshold) -> {
                         updateDockSide(DockSide.RIGHT)
                         animateMiniToMasked(currentY)
                     }
 
                     else -> {
                         updateDockSide(resolveDockSide(currentX))
-                        val snapX = if (dockSide == DockSide.LEFT) 0 else screenWidth - miniSize
+                        val snapX = if (dockSide == DockSide.LEFT) leftMiniDockX() else rightMiniDockX()
                         animateMiniToDocked(snapX, currentY)
                     }
                 }
@@ -1024,28 +1026,28 @@ class OverlayService : Service() {
 
     private fun resolveMiniTargetPosition(): Pair<Int, Int> {
         if (!hasMiniPosition) {
-            val firstX = screenWidth - miniSize
+            val firstX = rightMiniDockX()
             val firstY = clampMiniY((screenHeight * FIRST_MINI_Y_RATIO).roundToInt())
             updateDockSide(DockSide.RIGHT)
             return firstX to firstY
         }
 
-        val x = if (lastMiniVisibleX <= 0) {
+        val x = if (lastMiniVisibleX + miniSize / 2 <= screenWidth / 2) {
             updateDockSide(DockSide.LEFT)
-            0
+            leftMiniDockX()
         } else {
             updateDockSide(DockSide.RIGHT)
-            screenWidth - miniSize
+            rightMiniDockX()
         }
         return x to clampMiniY(lastMiniVisibleY)
     }
 
     private fun rememberMiniVisiblePosition(x: Int, y: Int) {
-        val snappedX = if (x <= screenWidth / 2) 0 else screenWidth - miniSize
+        val snappedX = if (x + miniSize / 2 <= screenWidth / 2) leftMiniDockX() else rightMiniDockX()
         lastMiniVisibleX = snappedX
         lastMiniVisibleY = clampMiniY(y)
         hasMiniPosition = true
-        updateDockSide(if (snappedX == 0) DockSide.LEFT else DockSide.RIGHT)
+        updateDockSide(if (snappedX == leftMiniDockX()) DockSide.LEFT else DockSide.RIGHT)
     }
 
     private fun animateLargeToMini(targetX: Int, targetY: Int) {
@@ -1140,7 +1142,7 @@ class OverlayService : Service() {
             screenWidth - miniSize / 2
         }
 
-        val visibleX = if (dockSide == DockSide.LEFT) 0 else screenWidth - miniSize
+        val visibleX = if (dockSide == DockSide.LEFT) leftMiniDockX() else rightMiniDockX()
         rememberMiniVisiblePosition(visibleX, clampedY)
 
         animateMiniPair(
@@ -1159,7 +1161,7 @@ class OverlayService : Service() {
     }
 
     private fun animateMaskedToMini() {
-        val targetX = if (dockSide == DockSide.LEFT) 0 else screenWidth - miniSize
+        val targetX = if (dockSide == DockSide.LEFT) leftMiniDockX() else rightMiniDockX()
         val targetY = clampMiniY(miniTouchParams?.y ?: resolveMiniTargetPosition().second)
 
         animateMiniPair(
@@ -1528,6 +1530,14 @@ class OverlayService : Service() {
         return (miniSize * MINI_MASK_TRIGGER_RATIO).roundToInt()
     }
 
+    private fun leftMiniDockX(): Int {
+        return miniDockEdgeInsetPx
+    }
+
+    private fun rightMiniDockX(): Int {
+        return (screenWidth - miniSize - miniDockEdgeInsetPx).coerceAtLeast(leftMiniDockX())
+    }
+
     private fun clampMiniY(value: Int): Int {
         val minY = topInset
         val maxY = (screenHeight - bottomInset - miniHeight).coerceAtLeast(minY)
@@ -1611,6 +1621,8 @@ class OverlayService : Service() {
         private const val MINI_MIN_SIZE_DP = 80f
         // 小窗口圆角半径（dp）
         private const val MINI_CORNER_RADIUS_DP = 24f
+        // 小窗口贴边时与屏幕边缘的间距（dp）
+        private const val MINI_DOCK_EDGE_INSET_DP = 6f
 
         // 触发小窗口的拖拽距离比例
         private const val MINI_TRIGGER_DISTANCE_RATIO = 0.2f
